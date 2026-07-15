@@ -33,8 +33,25 @@ These are the things where deviation produces silent failures or broken output. 
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use/` project directory.
 13. **Subtitle layout requires full-resolution QC.** Never approve subtitle size or position from a thumbnail/contact sheet. After the captioned preview, run `subtitle_check.py`, inspect every sampled PNG at full resolution, and adjust before final rendering.
 14. **Persistent overlays require composition QC.** Check their intended canvas anchor numerically (for example, a centered card must use `x = (canvas_width - card_width) / 2`) and inspect first, middle, and final frames both full-resolution and at normal playback scale. Clearance and non-obstruction checks alone do not establish visual balance.
+15. **External media upload requires consent.** Get explicit approval before uploading local audio or video to ElevenLabs or any other external service. State what will be uploaded, to which provider, and why. Record the approval scope and source inventory in `edit/run.json`; changed or replaced sources require renewed approval.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
+
+## Workflow routing
+
+Use one shared engine with zero or one selected editorial workflow. Read only the matching workflow file; do not load all workflows into context. The generic path uses no workflow file.
+
+| User outcome | Workflow instructions | Current scope |
+| --- | --- | --- |
+| A montage or social piece built from multiple street-interview answers | `workflows/street-interview.md` | Foundation |
+| Short promotional clips from one podcast episode, including split episode files | `workflows/podcast-clips.md` | Candidate handoff; one clip render per run |
+| Long-form podcast cleanup, cut planning, or rough editing | `workflows/podcast-edit.md` | Handoff-first |
+
+If the request clearly matches a row, use it. If the request is generic, continue with the general process in this file. Ask one routing question only when the choice materially changes the deliverables or approvals.
+
+Workflow files specialize editorial judgment, approval gates, and outputs. They never override the hard rules. Do not claim a workflow capability beyond the maturity and limits stated in its file.
+
+At the beginning of a run, create or resume `edit/run.json` from `workflows/run.example.json` using the state contract in `docs/architecture.md`. Use `workflow: generic` when no workflow file is selected. Read the last `project.md` session, refresh the source inventory, and set one explicit next action. The host agent is the orchestrator; do not create Python workflow classes or a second execution engine.
 
 ## Directory layout
 
@@ -45,6 +62,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session
+    ├── run.json                 ← workflow, approvals, artifacts, checks, and resume state
     ├── takes_packed.md          ← phrase-level transcripts, the LLM's primary reading view
     ├── edl.json                 ← cut decisions
     ├── transcripts/<name>.json  ← cached raw Scribe JSON
@@ -78,7 +96,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline; add `--subtitle-case natural` to preserve Scribe capitalization.
+- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for a 1080p evaluable preview; `--draft` for a 720p cut-point check. `--build-subtitles` generates master.srt inline; add `--subtitle-case natural` to preserve Scribe capitalization.
 - **`subtitle_check.py <video> --srt <master.srt>`** — extracts representative subtitle frames at full output resolution. Mandatory before approving subtitle size/position.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
@@ -86,10 +104,11 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 ## The process
 
-1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
+0. **Route + resume.** Select zero or one workflow file, then read or create `edit/run.json` and read the last `project.md` session. Refresh literal source paths, sizes, and modification times instead of trusting stale state. The current transcript cache is filename-stem based, so treat a same-name replacement as stale and move its old transcript aside before retranscribing.
+1. **Inventory.** `ffprobe` every source. Before calling `transcribe.py` or `transcribe_batch.py`, explain that audio will be sent to ElevenLabs Scribe and wait for explicit approval. Record the approved source scope in `edit/run.json`. Then transcribe, pack transcripts into `takes_packed.md`, and sample one or two `timeline_view`s for a visual first impression.
 2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
 3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
-4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
+4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.** A selected workflow may require a separate selects or cut-list approval before rendering.
 5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
 6. **Preview.** `render.py --preview`. When subtitles are enabled, treat size and placement as provisional.
 7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
@@ -105,7 +124,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
    **Subtitle QC is a separate full-resolution pass.** Run `subtitle_check.py` against the captioned preview and its master SRT. Inspect every PNG at full resolution for text size, face obstruction, frame-edge clearance, platform UI clearance, outline weight, and readability. Timeline/contact-sheet thumbnails are not valid evidence for subtitle layout. Adjust `render.py` with `--subtitle-font-size`, `--subtitle-margin-v`, `--subtitle-alignment`, or `--subtitle-outline`, rerender the preview, and repeat the subtitle check.
 
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
-8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
+8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe unchanged sources. Final render only after preview approval. Append to `project.md`, update checks and artifacts in `edit/run.json`, and set `status` to `complete` only when every required deliverable and QC check is resolved.
 
 ## Cut craft (techniques)
 
@@ -133,7 +152,7 @@ Example line:
 When the task is "pick the best take of each beat across many clips," spawn a dedicated sub-agent with a brief shaped like this. The structure is load-bearing; the pitch-shape example is not.
 
 ```
-You are editing a <type> video. Pick the best take of each beat and 
+You are editing a <type> video. Pick the best take of each beat and
 assemble them chronologically by beat, not by source clip order.
 
 INPUTS:
@@ -299,9 +318,9 @@ Match the source unless the user asked for something specific. Common targets: `
   ],
   "grade": "warm_cinematic",
   "overlays": [
-    {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
+    {"file": "animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
   ],
-  "subtitles": "edit/master.srt",
+  "subtitles": "master.srt",
   "total_duration_s": 87.4
 }
 ```
