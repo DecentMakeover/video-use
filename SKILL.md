@@ -31,6 +31,8 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use/` project directory.
+13. **Subtitle layout requires full-resolution QC.** Never approve subtitle size or position from a thumbnail/contact sheet. After the captioned preview, run `subtitle_check.py`, inspect every sampled PNG at full resolution, and adjust before final rendering.
+14. **Persistent overlays require composition QC.** Check their intended canvas anchor numerically (for example, a centered card must use `x = (canvas_width - card_width) / 2`) and inspect first, middle, and final frames both full-resolution and at normal playback scale. Clearance and non-obstruction checks alone do not establish visual balance.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -51,6 +53,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
     ├── master.srt               ← output-timeline subtitles
     ├── downloads/               ← yt-dlp outputs
     ├── verify/                  ← debug frames / timeline PNGs
+    │   └── subtitles/          ← full-resolution subtitle QC samples
     ├── preview.mp4
     └── final.mp4
 ```
@@ -75,7 +78,8 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
+- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline; add `--subtitle-case natural` to preserve Scribe capitalization.
+- **`subtitle_check.py <video> --srt <master.srt>`** — extracts representative subtitle frames at full output resolution. Mandatory before approving subtitle size/position.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
@@ -87,14 +91,18 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
 4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
 5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
-6. **Preview.** `render.py --preview`.
+6. **Preview.** `render.py --preview`. When subtitles are enabled, treat size and placement as provisional.
 7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
    - Visual discontinuity / flash / jump at the cut
    - Waveform spike at the boundary (audio pop that slipped past the 30ms fade)
    - Subtitle hidden behind an overlay (Rule 1 violation)
    - Overlay misaligned or showing wrong frames (Rule 4 violation)
+   - Persistent overlay alignment against its intended canvas anchor (centerline, edge margin, or grid)
+   - Persistent overlay balance at normal playback scale, not only at full resolution
 
-   Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
+   Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency and overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
+
+   **Subtitle QC is a separate full-resolution pass.** Run `subtitle_check.py` against the captioned preview and its master SRT. Inspect every PNG at full resolution for text size, face obstruction, frame-edge clearance, platform UI clearance, outline weight, and readability. Timeline/contact-sheet thumbnails are not valid evidence for subtitle layout. Adjust `render.py` with `--subtitle-font-size`, `--subtitle-margin-v`, `--subtitle-alignment`, or `--subtitle-outline`, rerender the preview, and repeat the subtitle check.
 
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
 8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
@@ -178,6 +186,18 @@ Hard rules: apply **per-segment during extraction** (not post-concat, which re-e
 ## Subtitles (when requested)
 
 Subtitles have three dimensions worth reasoning about: **chunking** (1/2/3/sentence per line), **case** (UPPER/Title/Natural), and **placement** (margin from bottom). The right combo depends on content.
+
+Size and placement are scene-dependent, not universal presets. A platform-safe lower-third can still cover a speaker's face when the subject sits low in a vertical frame. `render.py` therefore uses conservative aspect-aware starting points (portrait: `FontSize=10`, `MarginV=90`; landscape: `FontSize=18`, `MarginV=35`) and exposes explicit overrides:
+
+```bash
+python helpers/render.py edit/edl.json -o edit/preview.mp4 --preview --build-subtitles \
+  --subtitle-case natural --subtitle-font-size 10 --subtitle-margin-v 90
+
+python helpers/subtitle_check.py edit/preview.mp4 --srt edit/master.srt \
+  --output-dir edit/verify/subtitles --samples 7
+```
+
+Open every generated PNG at full resolution. If subtitles cover faces or dominate the frame, reduce `--subtitle-font-size`; if they sit on faces, adjust `--subtitle-margin-v` (higher moves bottom-aligned captions up, lower moves them down) or change `--subtitle-alignment`. Rerender and repeat until the samples pass. Only then render the final output.
 
 **Worked styles** — pick, adapt, or invent:
 
@@ -320,3 +340,4 @@ Things that consistently fail regardless of style:
 - **Editing before confirming the strategy.** Never.
 - **Re-transcribing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
+- **Approving subtitle layout from a contact sheet.** Thumbnail views hide oversized text and face obstruction. Use full-resolution `subtitle_check.py` samples.

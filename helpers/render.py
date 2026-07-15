@@ -9,13 +9,16 @@ Implements the HEURISTICS render pipeline in the correct order:
      and applies `subtitles` filter LAST → final.mp4
 
 Optionally builds a master SRT from the per-source transcripts + EDL
-output-timeline offsets, applies the proven force_style (2-word
-UPPERCASE chunks, Helvetica 18 Bold, MarginV=35).
+output-timeline offsets. Subtitle size and placement are aspect-aware starting
+points and can be overridden per render; they still require full-resolution
+visual QC via helpers/subtitle_check.py.
 
 Usage:
     python helpers/render.py <edl.json> -o final.mp4
     python helpers/render.py <edl.json> -o preview.mp4 --preview
     python helpers/render.py <edl.json> -o final.mp4 --build-subtitles
+    python helpers/render.py <edl.json> -o preview.mp4 --build-subtitles \
+      --subtitle-case natural --subtitle-font-size 10 --subtitle-margin-v 90
     python helpers/render.py <edl.json> -o final.mp4 --no-subtitles
 """
 
@@ -38,22 +41,25 @@ except Exception:
         return "eq=contrast=1.03:saturation=0.98", {}
 
 
-# -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
+# -------- Subtitle style -----------------------------------------------------
 #
-# MarginV is NOT taste — it is a platform safe-zone rule.
-# TikTok / IG Reels / Shorts UI (caption, username, music, right-rail actions)
-# covers roughly the bottom ~25–30% of a 1080×1920 frame. Captions placed near
-# the bottom edge get clipped or obscured by the UI. libass auto-scales the
-# render canvas relative to PlayResY=288, so MarginV=90 lands the caption
-# baseline roughly 30% up from the bottom on any aspect — clear of the UI on
-# every major vertical-video platform. Do not drop this below ~75 without a
-# specific reason.
-SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
-    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-    "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
-)
+# libass scales SRT force_style values against a 288-line reference canvas.
+# A FontSize of 18 therefore becomes roughly 120 px on a 1080x1920 render.
+# That is reasonable for some landscape videos but oversized for portrait
+# interviews. These defaults are only starting points; subtitle_check.py must
+# be used to inspect full-resolution frames before a final render is approved.
+
+PORTRAIT_SUBTITLE_DEFAULTS = {
+    "font_size": 10.0,
+    "margin_v": 90,
+    "outline": 1.5,
+}
+
+LANDSCAPE_SUBTITLE_DEFAULTS = {
+    "font_size": 18.0,
+    "margin_v": 35,
+    "outline": 2.0,
+}
 
 # -------- Helpers ------------------------------------------------------------
 
@@ -62,6 +68,57 @@ def run(cmd: list[str], quiet: bool = False) -> None:
     if not quiet:
         print(f"  $ {' '.join(str(c) for c in cmd[:6])}{' …' if len(cmd) > 6 else ''}")
     subprocess.run(cmd, check=True)
+
+
+def video_dimensions(video: Path) -> tuple[int, int]:
+    """Return displayed width/height for an already-rendered video."""
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0", str(video),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    width, height = map(int, out.stdout.strip().split(",")[:2])
+    return width, height
+
+
+def build_subtitle_force_style(
+    video: Path,
+    font_size: float | None = None,
+    margin_v: int | None = None,
+    alignment: int = 2,
+    outline: float | None = None,
+    raw_style: str | None = None,
+) -> str:
+    """Build an ASS force_style with aspect-aware defaults.
+
+    Portrait defaults are deliberately smaller than the historical
+    bold-overlay values and start above the busiest platform UI region. Every
+    result still requires full-resolution subtitle QC.
+    """
+    if raw_style:
+        return raw_style
+
+    width, height = video_dimensions(video)
+    defaults = (
+        PORTRAIT_SUBTITLE_DEFAULTS
+        if height > width
+        else LANDSCAPE_SUBTITLE_DEFAULTS
+    )
+    chosen_font_size = font_size if font_size is not None else defaults["font_size"]
+    chosen_margin_v = margin_v if margin_v is not None else defaults["margin_v"]
+    chosen_outline = outline if outline is not None else defaults["outline"]
+
+    return (
+        f"FontName=Helvetica,FontSize={chosen_font_size:g},Bold=1,"
+        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
+        f"BorderStyle=1,Outline={chosen_outline:g},Shadow=0,"
+        f"Alignment={alignment},MarginV={chosen_margin_v}"
+    )
 
 
 def resolve_grade_filter(grade_field: str | None) -> str:
@@ -131,8 +188,40 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
+def _stream_rotation(video: Path) -> int:
+    """Return the display-matrix rotation in degrees (0/±90/180/270), 0 if none.
+
+    Phones shoot in a fixed sensor orientation and record a rotation display
+    matrix (iPhone: side_data 'rotation'; legacy: stream tag 'rotate'). ffmpeg
+    auto-applies it on decode, so the *displayed* frame can be portrait even
+    when the coded frame is landscape.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream_side_data=rotation:stream_tags=rotate",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if not line or line == "N/A":
+                continue
+            try:
+                return int(round(float(line)))
+            except ValueError:
+                continue
+    except subprocess.CalledProcessError:
+        pass
+    return 0
+
+
 def is_portrait_source(video: Path) -> bool:
-    """Return True if the video's height > width (portrait / vertical)."""
+    """Return True if the *displayed* frame (after rotation) is portrait.
+
+    Reads coded width/height and swaps them when a ±90°/270° display-matrix
+    rotation is present, matching what ffmpeg feeds the filter chain on decode.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -140,7 +229,9 @@ def is_portrait_source(video: Path) -> bool:
              "-of", "csv=p=0", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
+        w, h = map(int, out.stdout.strip().split(",")[:2])
+        if abs(_stream_rotation(video)) % 180 == 90:
+            w, h = h, w
         return h > w
     except Exception:
         return False
@@ -312,11 +403,16 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
     return out
 
 
-def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
+def build_master_srt(
+    edl: dict,
+    edit_dir: Path,
+    out_path: Path,
+    text_case: str = "upper",
+) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
     - 2-word chunks (break on any punctuation in between)
-    - UPPERCASE text
+    - UPPERCASE text by default; natural preserves the Scribe transcript case
     - Output times computed as word.start - segment_start + segment_offset
     """
     transcripts_dir = edit_dir / "transcripts"
@@ -365,9 +461,12 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
                 out_end = out_start + 0.4
             text = " ".join((w.get("text") or "").strip() for w in chunk)
             text = re.sub(r"\s+", " ", text).strip()
-            # Strip trailing punctuation for cleaner uppercase look
+            # Strip pause punctuation that looks awkward on short chunks.
             text = text.rstrip(",;:")
-            text = text.upper()
+            if text_case == "upper":
+                text = text.upper()
+            elif text_case != "natural":
+                raise ValueError(f"unsupported subtitle case: {text_case}")
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
@@ -499,6 +598,7 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    subtitle_force_style: str | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -538,8 +638,10 @@ def build_final_composite(
     # Subtitles LAST — Rule 1
     if has_subs:
         subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        resolved_style = subtitle_force_style or build_subtitle_force_style(base_path)
+        style = resolved_style.replace("'", r"\'")
         filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
+            f"{current}subtitles='{subs_abs}':force_style='{style}'[outv]"
         )
         out_label = "[outv]"
     else:
@@ -566,6 +668,8 @@ def build_final_composite(
     ]
     print(f"compositing → {out_path.name}")
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    if has_subs:
+        print(f"  subtitle style: {subtitle_force_style or build_subtitle_force_style(base_path)}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -592,9 +696,46 @@ def main() -> None:
         help="Build master.srt from transcripts + EDL offsets before compositing",
     )
     ap.add_argument(
+        "--subtitle-case",
+        choices=("upper", "natural"),
+        default="upper",
+        help="Caption case when building subtitles (default: upper).",
+    )
+    ap.add_argument(
         "--no-subtitles",
         action="store_true",
         help="Skip subtitles even if the EDL references one",
+    )
+    ap.add_argument(
+        "--subtitle-font-size",
+        type=float,
+        default=None,
+        help="ASS font size override. Portrait auto-default: 10; landscape: 18.",
+    )
+    ap.add_argument(
+        "--subtitle-margin-v",
+        type=int,
+        default=None,
+        help="ASS vertical margin override. Higher moves bottom-aligned text upward.",
+    )
+    ap.add_argument(
+        "--subtitle-alignment",
+        type=int,
+        choices=range(1, 10),
+        default=2,
+        help="ASS numpad alignment (default: 2, bottom-center).",
+    )
+    ap.add_argument(
+        "--subtitle-outline",
+        type=float,
+        default=None,
+        help="ASS outline thickness override. Portrait auto-default: 1.5.",
+    )
+    ap.add_argument(
+        "--subtitle-force-style",
+        type=str,
+        default=None,
+        help="Raw ASS force_style override; replaces all generated subtitle styling.",
     )
     ap.add_argument(
         "--no-loudnorm",
@@ -602,6 +743,13 @@ def main() -> None:
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
     args = ap.parse_args()
+
+    if args.subtitle_font_size is not None and args.subtitle_font_size <= 0:
+        ap.error("--subtitle-font-size must be > 0")
+    if args.subtitle_margin_v is not None and args.subtitle_margin_v < 0:
+        ap.error("--subtitle-margin-v must be >= 0")
+    if args.subtitle_outline is not None and args.subtitle_outline < 0:
+        ap.error("--subtitle-outline must be >= 0")
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -631,22 +779,40 @@ def main() -> None:
     if not args.no_subtitles:
         if args.build_subtitles:
             subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            build_master_srt(
+                edl,
+                edit_dir,
+                subs_path,
+                text_case=args.subtitle_case,
+            )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
             if not subs_path.exists():
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
 
+    subtitle_force_style = build_subtitle_force_style(
+        base_path,
+        font_size=args.subtitle_font_size,
+        margin_v=args.subtitle_margin_v,
+        alignment=args.subtitle_alignment,
+        outline=args.subtitle_outline,
+        raw_style=args.subtitle_force_style,
+    )
+
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(
+            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style
+        )
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(
+            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style
+        )
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
