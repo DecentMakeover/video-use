@@ -35,6 +35,7 @@ Do not use a numeric answer score or silently optimize for controversy. Do not r
 - Detect rotation and HDR correctly
 - Enforce word-boundary padding and audio fades
 - Apply supported source-derived scaling plus the approved caption, grade, and loudness treatment
+- Generate approved respondent name/company cards with the parameterized `identity_overlay.py` helper rather than hard-coded session scripts
 - Produce cut-boundary, subtitle, overlay, and output-property evidence
 
 Face or noise detection may surface review candidates. It must not decide consent or editorial worth.

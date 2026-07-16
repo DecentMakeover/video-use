@@ -98,6 +98,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for a 1080p evaluable preview; `--draft` for a 720p cut-point check. `--build-subtitles` generates master.srt inline; add `--subtitle-case natural` to preserve Scribe capitalization.
 - **`subtitle_check.py <video> --srt <master.srt>`** — extracts representative subtitle frames at full output resolution. Mandatory before approving subtitle size/position.
+- **`identity_overlay.py --name <name> --company <company> --output <mov>`** — generates a measured, high-contrast two-row identity card on a transparent 1080×1920 canvas. Colors are configurable; inspect full-resolution and phone-scale frames before approval.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
