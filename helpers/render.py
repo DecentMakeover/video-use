@@ -157,12 +157,17 @@ def build_subtitle_force_style(
     alignment: int = 2,
     outline: float | None = None,
     raw_style: str | None = None,
+    font_name: str | None = None,
+    bold: bool = True,
 ) -> str:
     """Build an ASS force_style with aspect-aware defaults.
 
     Portrait defaults are deliberately smaller than the historical
     bold-overlay values and start above the busiest platform UI region. Every
     result still requires full-resolution subtitle QC.
+
+    Set bold=False for single-weight display fonts (Anton, Archivo Black, …)
+    where libass faux-bold would distort the glyphs.
     """
     if raw_style:
         return raw_style
@@ -176,9 +181,10 @@ def build_subtitle_force_style(
     chosen_font_size = font_size if font_size is not None else defaults["font_size"]
     chosen_margin_v = margin_v if margin_v is not None else defaults["margin_v"]
     chosen_outline = outline if outline is not None else defaults["outline"]
+    chosen_font_name = font_name or "Helvetica"
 
     return (
-        f"FontName=Helvetica,FontSize={chosen_font_size:g},Bold=1,"
+        f"FontName={chosen_font_name},FontSize={chosen_font_size:g},Bold={1 if bold else 0},"
         "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
         f"BorderStyle=1,Outline={chosen_outline:g},Shadow=0,"
         f"Alignment={alignment},MarginV={chosen_margin_v}"
@@ -701,6 +707,7 @@ def build_final_composite(
     out_path: Path,
     edit_dir: Path,
     subtitle_force_style: str | None = None,
+    fonts_dir: Path | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -742,8 +749,12 @@ def build_final_composite(
         subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
         resolved_style = subtitle_force_style or build_subtitle_force_style(base_path)
         style = resolved_style.replace("'", r"\'")
+        fonts_arg = ""
+        if fonts_dir is not None:
+            fonts_abs = str(fonts_dir.resolve()).replace(":", r"\:").replace("'", r"\'")
+            fonts_arg = f":fontsdir='{fonts_abs}'"
         filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{style}'[outv]"
+            f"{current}subtitles='{subs_abs}':force_style='{style}'{fonts_arg}[outv]"
         )
         out_label = "[outv]"
     else:
@@ -840,6 +851,24 @@ def main() -> None:
         help="Raw ASS force_style override; replaces all generated subtitle styling.",
     )
     ap.add_argument(
+        "--subtitle-font-name",
+        type=str,
+        default=None,
+        help="Caption font family name (default: Helvetica).",
+    )
+    ap.add_argument(
+        "--subtitle-fonts-dir",
+        type=Path,
+        default=None,
+        help="Extra directory of font files for libass (subtitles fontsdir).",
+    )
+    ap.add_argument(
+        "--subtitle-no-bold",
+        action="store_true",
+        help="Do not force Bold=1 — use for single-weight display fonts "
+        "(Anton, Archivo Black, …) where faux-bold distorts glyphs.",
+    )
+    ap.add_argument(
         "--no-loudnorm",
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
@@ -900,20 +929,26 @@ def main() -> None:
         alignment=args.subtitle_alignment,
         outline=args.subtitle_outline,
         raw_style=args.subtitle_force_style,
+        font_name=args.subtitle_font_name,
+        bold=not args.subtitle_no_bold,
     )
+    if args.subtitle_fonts_dir is not None and not args.subtitle_fonts_dir.is_dir():
+        sys.exit(f"--subtitle-fonts-dir is not a directory: {args.subtitle_fonts_dir}")
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
     if args.no_loudnorm:
         # Composite directly to final output
         build_final_composite(
-            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style
+            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style,
+            fonts_dir=args.subtitle_fonts_dir,
         )
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
         build_final_composite(
-            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style
+            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style,
+            fonts_dir=args.subtitle_fonts_dir,
         )
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
