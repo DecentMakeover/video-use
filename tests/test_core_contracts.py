@@ -64,6 +64,50 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.03", audio_filter)
         self.assertIn("afade=t=out:st=1.970:d=0.03", audio_filter)
 
+    def test_fps_and_crf_overrides_reach_the_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "segment.mp4"
+            with (
+                patch.object(render, "is_portrait_source", return_value=False),
+                patch.object(render, "is_hdr_source", return_value=False),
+                patch.object(render.subprocess, "run") as run,
+            ):
+                render.extract_segment(
+                    Path("source.mp4"),
+                    seg_start=0.0,
+                    duration=2.0,
+                    grade_filter="",
+                    out_path=output,
+                    fps="30/1",
+                    crf=18,
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-r") + 1], "30/1")
+        self.assertEqual(command[command.index("-crf") + 1], "18")
+
+    def test_source_fps_mode_probes_each_source_once(self) -> None:
+        edl = {
+            "sources": {"a": "a.mp4"},
+            "ranges": [
+                {"source": "a", "start": 0.0, "end": 1.0},
+                {"source": "a", "start": 2.0, "end": 3.0},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(render, "source_fps", return_value="30/1") as probe,
+                patch.object(render, "extract_segment") as extract,
+            ):
+                render.extract_all_segments(
+                    edl, Path(tmp), preview=False, fps="source", crf=17
+                )
+
+        self.assertEqual(probe.call_count, 1)
+        for call in extract.call_args_list:
+            self.assertEqual(call.kwargs["fps"], "30/1")
+            self.assertEqual(call.kwargs["crf"], 17)
+
     def test_composite_shifts_overlays_and_applies_subtitles_last(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             edit_dir = Path(tmp)

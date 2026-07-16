@@ -240,6 +240,20 @@ def is_portrait_source(video: Path) -> bool:
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
+def source_fps(video: Path) -> str:
+    """Probed r_frame_rate of the first video stream (e.g. '30/1')."""
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip().splitlines()[0]
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -248,6 +262,8 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    fps: str = "24",
+    crf: int | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -280,11 +296,12 @@ def extract_segment(
     af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
     if draft:
-        preset, crf = "ultrafast", "28"
+        preset, default_crf = "ultrafast", "28"
     elif preview:
-        preset, crf = "medium", "22"
+        preset, default_crf = "medium", "22"
     else:
-        preset, crf = "fast", "20"
+        preset, default_crf = "fast", "20"
+    crf_value = str(crf) if crf is not None else default_crf
 
     cmd = [
         "ffmpeg", "-y",
@@ -293,8 +310,8 @@ def extract_segment(
         "-t", f"{duration:.3f}",
         "-vf", vf,
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
+        "-c:v", "libx264", "-preset", preset, "-crf", crf_value,
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -307,6 +324,8 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    fps: str = "24",
+    crf: int | None = None,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -325,6 +344,7 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
 
+    fps_cache: dict[Path, str] = {}
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
     if is_auto:
@@ -346,7 +366,16 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        if fps == "source":
+            if src_path not in fps_cache:
+                fps_cache[src_path] = source_fps(src_path)
+            seg_fps = fps_cache[src_path]
+        else:
+            seg_fps = fps
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft, fps=seg_fps, crf=crf,
+        )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -691,6 +720,22 @@ def main() -> None:
         help="Draft mode: 720p, ultrafast, CRF 28 — cut-point verification only.",
     )
     ap.add_argument(
+        "--fps",
+        default="24",
+        help="Output frame rate: a number/fraction, or 'source' to keep each "
+        "source's native rate (default: 24, the current engine contract). "
+        "All EDL sources must share one rate when using 'source' — the concat "
+        "step assumes homogeneous segments.",
+    )
+    ap.add_argument(
+        "--crf",
+        type=int,
+        default=None,
+        help="Override libx264 CRF for segment extraction (default: 20 final / "
+        "22 preview / 28 draft). Lower = higher quality; 17-18 is visually "
+        "lossless for delivery masters.",
+    )
+    ap.add_argument(
         "--build-subtitles",
         action="store_true",
         help="Build master.srt from transcripts + EDL offsets before compositing",
@@ -761,7 +806,8 @@ def main() -> None:
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir, preview=args.preview, draft=args.draft,
+        fps=args.fps, crf=args.crf,
     )
 
     # 2. Concat → base
