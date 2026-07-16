@@ -86,6 +86,70 @@ def video_dimensions(video: Path) -> tuple[int, int]:
     return width, height
 
 
+# -------- Target-canvas reframing --------------------------------------------
+#
+# An EDL may declare a delivery canvas ("canvas": "1080x1920") that differs
+# from the source aspect (e.g. vertical social clips from a landscape
+# interview). Each range is cropped to the canvas aspect in source pixels,
+# then scaled to the canvas. Per-range "crop" ("w:h:x:y", source pixels)
+# positions the window on the subject; without it the crop is centered.
+
+
+def parse_canvas(value: str | None) -> tuple[int, int] | None:
+    """Parse an EDL canvas spec like "1080x1920" into (width, height)."""
+    if not value:
+        return None
+    m = re.fullmatch(r"(\d+)\s*[xX]\s*(\d+)", str(value).strip())
+    if not m:
+        raise ValueError(f"invalid canvas spec: {value!r} (expected WIDTHxHEIGHT)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def displayed_dimensions(video: Path) -> tuple[int, int]:
+    """Displayed width/height of a source, accounting for rotation metadata."""
+    w, h = video_dimensions(video)
+    if abs(_stream_rotation(video)) % 180 == 90:
+        w, h = h, w
+    return w, h
+
+
+def centered_crop(src_w: int, src_h: int, canvas: tuple[int, int]) -> str:
+    """Largest centered crop window matching the canvas aspect, as "w:h:x:y"."""
+    cw, ch = canvas
+    target_ar = cw / ch
+    if src_w / src_h > target_ar:
+        crop_h = src_h
+        crop_w = min(src_w, int(round(src_h * target_ar)))
+    else:
+        crop_w = src_w
+        crop_h = min(src_h, int(round(src_w / target_ar)))
+    crop_w -= crop_w % 2
+    crop_h -= crop_h % 2
+    x = (src_w - crop_w) // 2
+    y = (src_h - crop_h) // 2
+    return f"{crop_w}:{crop_h}:{x}:{y}"
+
+
+def validate_crop(crop: str, src_w: int, src_h: int, range_index: int) -> str:
+    """Validate a per-range crop spec "w:h:x:y" against source bounds."""
+    parts = str(crop).split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            f"range {range_index}: invalid crop {crop!r} (expected w:h:x:y)"
+        )
+    try:
+        w, h, x, y = (int(p) for p in parts)
+    except ValueError:
+        raise ValueError(
+            f"range {range_index}: crop {crop!r} must be four integers"
+        ) from None
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > src_w or y + h > src_h:
+        raise ValueError(
+            f"range {range_index}: crop {crop!r} outside source {src_w}x{src_h}"
+        )
+    return f"{w}:{h}:{x}:{y}"
+
+
 def build_subtitle_force_style(
     video: Path,
     font_size: float | None = None,
@@ -248,11 +312,15 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    crop_filter: str = "",
+    canvas: tuple[int, int] | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
+    With a target canvas, the range is cropped to the canvas aspect (crop_filter,
+    source pixels) and scaled to the exact canvas size instead.
 
     Quality ladder:
       - final (default): 1080p libx264 fast CRF 20
@@ -261,15 +329,25 @@ def extract_segment(
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+    if canvas:
+        cw, ch = canvas
+        if draft:
+            cw, ch = max(2, cw // 2), max(2, ch // 2)
+            cw -= cw % 2
+            ch -= ch % 2
+        scale = f"scale={cw}:{ch}"
     else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        portrait = is_portrait_source(source)
+        if draft:
+            scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        else:
+            scale = "scale=-2:1920" if portrait else "scale=1920:-2"
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
+    if crop_filter:
+        vf_parts.append(f"crop={crop_filter}")
     vf_parts.append(scale)
     if grade_filter:
         vf_parts.append(grade_filter)
@@ -317,6 +395,7 @@ def extract_all_segments(
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    canvas = parse_canvas(edl.get("canvas"))
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -324,9 +403,12 @@ def extract_all_segments(
 
     ranges = edl["ranges"]
     sources = edl["sources"]
+    src_dims: dict[str, tuple[int, int]] = {}
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    if canvas:
+        print(f"  (target canvas: {canvas[0]}x{canvas[1]})")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
@@ -337,6 +419,20 @@ def extract_all_segments(
         duration = end - start
         out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
+        crop_filter = ""
+        if canvas:
+            if src_name not in src_dims:
+                src_dims[src_name] = displayed_dimensions(src_path)
+            src_w, src_h = src_dims[src_name]
+            if r.get("crop"):
+                crop_filter = validate_crop(r["crop"], src_w, src_h, i)
+            else:
+                crop_filter = centered_crop(src_w, src_h, canvas)
+        elif r.get("crop"):
+            raise ValueError(
+                f"range {i}: 'crop' requires an EDL-level 'canvas' to scale into"
+            )
+
         if is_auto:
             seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
         else:
@@ -344,9 +440,15 @@ def extract_all_segments(
 
         note = r.get("beat") or r.get("note") or ""
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        if crop_filter:
+            print(f"        crop: {crop_filter}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft,
+            crop_filter=crop_filter, canvas=canvas,
+        )
         seg_paths.append(out_path)
 
     return seg_paths

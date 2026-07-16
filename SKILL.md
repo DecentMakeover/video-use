@@ -309,11 +309,12 @@ Match the source unless the user asked for something specific. Common targets: `
 ```json
 {
   "version": 1,
+  "canvas": "1080x1920",
   "sources": {"C0103": "/abs/path/C0103.MP4", "C0108": "/abs/path/C0108.MP4"},
   "ranges": [
     {"source": "C0103", "start": 2.42, "end": 6.85,
      "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
-    {"source": "C0108", "start": 14.30, "end": 28.90,
+    {"source": "C0108", "start": 14.30, "end": 28.90, "crop": "608:1080:584:0",
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start."}
   ],
   "grade": "warm_cinematic",
@@ -326,6 +327,8 @@ Match the source unless the user asked for something specific. Common targets: `
 ```
 
 `grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+
+`canvas` (optional, `"WIDTHxHEIGHT"`) declares a delivery canvas that may differ from the source aspect — e.g. `"1080x1920"` for vertical social clips from a landscape interview. Each range is cropped to the canvas aspect in source pixels and scaled to the exact canvas size. Per-range `crop` (`"w:h:x:y"`, source pixels, validated against source bounds) positions the window on the subject; without it the crop is centered. Position the crop from actual frames at the range's timestamps, not assumptions — subjects sit off-center.
 
 ## Memory — `project.md`
 

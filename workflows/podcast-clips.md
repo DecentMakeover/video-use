@@ -62,4 +62,4 @@ The candidate handoff is complete when every row maps to an exact source range a
 
 ## Current limits
 
-EDL v1 can cut homogeneous sequential sources, but the engine does not yet provide namespaced multi-output runs, target-canvas reframing, mixed-aspect concat, or active-speaker tracking. Do not automate or claim a rendered batch from the current flat workspace.
+EDL v1 can cut homogeneous sequential sources and reframe to a target canvas (EDL `canvas` + per-range `crop`, e.g. vertical 1080x1920 clips from a landscape interview with a static per-range crop window). The engine does not yet provide namespaced multi-output runs, mixed-aspect concat, or active-speaker tracking. Do not automate or claim a rendered batch from the current flat workspace.
