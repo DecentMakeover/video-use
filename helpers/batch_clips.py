@@ -26,6 +26,18 @@ from typing import Any
 
 
 CANVAS = "1080x1920"
+
+# Hook title card (persistent top overlay) — locked style from the S2 pilot:
+# white rounded card, Montserrat Black 48, top-center, clear of platform UI.
+TITLE_FONT_FILE = "Montserrat-Black.ttf"
+TITLE_FONT_SIZE = 48
+TITLE_CARD_Y = 120
+TITLE_PAD_X = 40
+TITLE_PAD_Y = 26
+TITLE_LINE_GAP = 8
+TITLE_RADIUS = 26
+TITLE_CARD_FILL = (255, 255, 255, 242)
+TITLE_TEXT_FILL = (12, 12, 12, 255)
 CROP_WIDTH = 608
 CROP_HEIGHT = 1080
 OUTPUT_FPS = 24
@@ -102,6 +114,16 @@ def load_spec(path: Path) -> tuple[str, Path, list[dict[str, Any]]]:
             raise ValueError(f"{clip_id}.crop_x must be an integer") from exc
         if crop_x < 0 or crop_x + CROP_WIDTH > 1920:
             raise ValueError(f"{clip_id}: crop_x {crop_x} is outside the 1920px source")
+        title = clip.get("title")
+        if title is not None:
+            if (
+                not isinstance(title, list)
+                or not 1 <= len(title) <= 3
+                or not all(isinstance(l, str) and l.strip() for l in title)
+            ):
+                raise ValueError(
+                    f"{clip_id}.title must be a list of 1-3 non-empty strings"
+                )
     return source_name.strip(), Path(source_path).expanduser(), data
 
 
@@ -274,6 +296,43 @@ def build_clip_edl(
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def build_title_card(
+    lines: list[str], font_path: Path, out_path: Path, canvas_wh: tuple[int, int]
+) -> tuple[int, int]:
+    """Render the hook title card as a transparent full-canvas PNG.
+
+    Returns (card_width, card_bottom_y) for composition checks. The card is
+    horizontally centered (Hard Rule 14 anchor: x = (canvas - card_w) / 2).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = canvas_wh
+    font = ImageFont.truetype(str(font_path), TITLE_FONT_SIZE)
+    widths = [font.getbbox(l)[2] - font.getbbox(l)[0] for l in lines]
+    line_h = font.getbbox("Ag")[3] - font.getbbox("Ag")[1]
+    card_w = max(widths) + 2 * TITLE_PAD_X
+    card_h = 2 * TITLE_PAD_Y + len(lines) * line_h + (len(lines) - 1) * TITLE_LINE_GAP
+    if card_w > W - 80:
+        raise ValueError(f"title too wide for canvas: {lines!r} ({card_w}px)")
+    card_x = (W - card_w) // 2
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle(
+        [card_x, TITLE_CARD_Y, card_x + card_w, TITLE_CARD_Y + card_h],
+        radius=TITLE_RADIUS,
+        fill=TITLE_CARD_FILL,
+    )
+    y = TITLE_CARD_Y + TITLE_PAD_Y
+    for line, w in zip(lines, widths):
+        bbox = font.getbbox(line)
+        d.text(((W - w) // 2 - bbox[0], y - bbox[1]), line, font=font, fill=TITLE_TEXT_FILL)
+        y += line_h + TITLE_LINE_GAP
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return card_w, TITLE_CARD_Y + card_h
 
 
 def render_clip(
@@ -510,6 +569,22 @@ def process_clip(
         edl, snapped_start, snapped_end = build_clip_edl(
             clip, words, source_name, source_path
         )
+        title_lines = clip.get("title")
+        if title_lines:
+            canvas_wh = tuple(int(v) for v in CANVAS.split("x"))
+            build_title_card(
+                [str(l) for l in title_lines],
+                edit_dir / "fonts" / TITLE_FONT_FILE,
+                work_dir / "title.png",
+                canvas_wh,
+            )
+            edl["overlays"] = [
+                {
+                    "file": str((work_dir / "title.png").resolve()),
+                    "start_in_output": 0.0,
+                    "duration": edl["total_duration_s"],
+                }
+            ]
         write_json(work_dir / "edl.json", edl)
     except Exception as exc:
         result = failed_result(clip, output_path, f"EDL preparation: {exc}")

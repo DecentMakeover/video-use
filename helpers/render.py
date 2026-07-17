@@ -766,6 +766,16 @@ def apply_loudnorm_two_pass(
 STILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
+def video_duration(video: Path) -> float:
+    """Container duration of a rendered video, in seconds."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(out.stdout.strip())
+
+
 def build_final_composite(
     base_path: Path,
     overlays: list[dict],
@@ -790,15 +800,17 @@ def build_final_composite(
         )
         return
 
+    base_duration = video_duration(base_path)
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
         if ov_path.suffix.lower() in STILL_IMAGE_EXTS:
-            # Loop a still (e.g. a title card PNG) for the overlay window;
-            # slight tail margin so the enable window never outruns frames.
-            dur = float(ov["duration"]) + 0.5
-            inputs += ["-loop", "1", "-framerate", "24", "-t", f"{dur:.3f}",
-                       "-i", str(ov_path)]
+            # Loop a still (e.g. a title card PNG) so it covers its overlay
+            # window; cut the looped stream to exactly the base duration so
+            # it can neither extend the composite past the base video nor
+            # (via repeatlast) starve a window that outruns it.
+            inputs += ["-loop", "1", "-framerate", "24",
+                       "-t", f"{base_duration:.3f}", "-i", str(ov_path)]
         else:
             inputs += ["-i", str(ov_path)]
 
