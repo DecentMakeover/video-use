@@ -86,6 +86,71 @@ class RenderContractTests(unittest.TestCase):
         self.assertEqual(command[command.index("-r") + 1], "30/1")
         self.assertEqual(command[command.index("-crf") + 1], "18")
 
+    def test_fade_through_black_reaches_video_and_audio_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "segment.mp4"
+            with (
+                patch.object(render, "is_portrait_source", return_value=False),
+                patch.object(render, "is_hdr_source", return_value=False),
+                patch.object(render.subprocess, "run") as run,
+            ):
+                render.extract_segment(
+                    Path("source.mp4"),
+                    seg_start=0.0,
+                    duration=5.0,
+                    grade_filter="",
+                    out_path=output,
+                    fade_in=0.5,
+                    fade_out=0.75,
+                )
+
+        command = run.call_args.args[0]
+        video_filter = command[command.index("-vf") + 1]
+        self.assertIn("fade=t=in:st=0:d=0.500", video_filter)
+        self.assertIn("fade=t=out:st=4.250:d=0.750", video_filter)
+        audio_filter = command[command.index("-af") + 1]
+        self.assertIn("afade=t=in:st=0:d=0.500", audio_filter)
+        self.assertIn("afade=t=out:st=4.250:d=0.750", audio_filter)
+
+    def test_fades_exceeding_segment_duration_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            render.extract_segment(
+                Path("source.mp4"),
+                seg_start=0.0,
+                duration=1.0,
+                grade_filter="",
+                out_path=Path("/tmp/never-written.mp4"),
+                fade_in=0.6,
+                fade_out=0.6,
+            )
+        with self.assertRaises(ValueError):
+            render.extract_segment(
+                Path("source.mp4"),
+                seg_start=0.0,
+                duration=1.0,
+                grade_filter="",
+                out_path=Path("/tmp/never-written.mp4"),
+                fade_in=-0.1,
+            )
+
+    def test_range_fades_flow_from_edl_to_extraction(self) -> None:
+        edl = {
+            "sources": {"a": "a.mp4"},
+            "ranges": [
+                {"source": "a", "start": 0.0, "end": 4.0, "fade_in": 0.3, "fade_out": 0.3},
+                {"source": "a", "start": 5.0, "end": 9.0},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(render, "extract_segment") as extract:
+                render.extract_all_segments(edl, Path(tmp), preview=False)
+
+        first, second = extract.call_args_list
+        self.assertEqual(first.kwargs["fade_in"], 0.3)
+        self.assertEqual(first.kwargs["fade_out"], 0.3)
+        self.assertEqual(second.kwargs["fade_in"], 0.0)
+        self.assertEqual(second.kwargs["fade_out"], 0.0)
+
     def test_source_fps_mode_probes_each_source_once(self) -> None:
         edl = {
             "sources": {"a": "a.mp4"},

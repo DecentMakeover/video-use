@@ -264,17 +264,31 @@ def extract_segment(
     draft: bool = False,
     fps: str = "24",
     crf: int | None = None,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
 
+    `fade_in`/`fade_out` (seconds) fade the segment from/to black for
+    montage-style transitions (cold opens, highlight reels). The audio fade
+    widens to match the visual fade, never below the 30ms de-pop floor.
+
     Quality ladder:
       - final (default): 1080p libx264 fast CRF 20
       - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
     """
+    if fade_in < 0 or fade_out < 0:
+        raise ValueError(
+            f"segment fades must be >= 0 (got fade_in={fade_in:g}, fade_out={fade_out:g})"
+        )
+    if fade_in + fade_out > duration + 1e-6:
+        raise ValueError(
+            f"segment fades ({fade_in:g}s + {fade_out:g}s) exceed the {duration:.3f}s segment"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
@@ -289,11 +303,18 @@ def extract_segment(
     vf_parts.append(scale)
     if grade_filter:
         vf_parts.append(grade_filter)
+    if fade_in > 0:
+        vf_parts.append(f"fade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        vf_parts.append(f"fade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}")
     vf = ",".join(vf_parts)
 
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
-    fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    # Audio fades at both edges: at least the 30ms de-pop (Rule 3), widened
+    # to track any visual fade so sound and picture arrive/leave together.
+    afade_in = max(0.03, fade_in)
+    afade_out = max(0.03, fade_out)
+    fade_out_start = max(0.0, duration - afade_out)
+    af = f"afade=t=in:st=0:d={afade_in:.3f},afade=t=out:st={fade_out_start:.3f}:d={afade_out:.3f}"
 
     if draft:
         preset, default_crf = "ultrafast", "28"
@@ -362,8 +383,14 @@ def extract_all_segments(
         else:
             seg_filter = resolved
 
+        fade_in = float(r.get("fade_in") or 0.0)
+        fade_out = float(r.get("fade_out") or 0.0)
+
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        fade_note = ""
+        if fade_in > 0 or fade_out > 0:
+            fade_note = f"  fade {fade_in:g}s/{fade_out:g}s"
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{fade_note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
         if fps == "source":
@@ -375,6 +402,7 @@ def extract_all_segments(
         extract_segment(
             src_path, start, duration, seg_filter, out_path,
             preview=preview, draft=draft, fps=seg_fps, crf=crf,
+            fade_in=fade_in, fade_out=fade_out,
         )
         seg_paths.append(out_path)
 
