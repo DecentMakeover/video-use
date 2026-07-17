@@ -487,6 +487,74 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
 
 PUNCT_BREAK = set(".,!?;:")
 
+# Words that read badly as the *last* word of a caption cue ("PAYING A").
+# When a cue would close on one of these, the word is deferred to the next cue.
+NO_TAIL_WORDS = {
+    "a", "an", "the", "of", "to", "for", "and", "or", "but", "nor",
+    "with", "at", "by", "from", "in", "on", "per", "than", "vs",
+}
+
+
+def _word_text(w: dict) -> str:
+    return re.sub(r"\s+", " ", (w.get("text") or "")).strip()
+
+
+def _ends_in_punct(text: str) -> bool:
+    return bool(text) and text[-1] in PUNCT_BREAK
+
+
+def _is_number_word(text: str) -> bool:
+    stripped = text.rstrip("".join(PUNCT_BREAK))
+    return bool(re.fullmatch(r"[\d][\d,.]*", stripped))
+
+
+def chunk_caption_words(words: list[dict], max_words: int = 2) -> list[list[dict]]:
+    """Group transcript words into caption cues that read naturally.
+
+    Base rule: up to max_words per cue, always break after punctuation.
+    Reading-order fixes on top:
+      - a cue never ends on a NO_TAIL_WORDS word ("PAYING A"): the cue keeps
+        extending through function words (up to max_words + 2) so grammatical
+        units stay together ("SORT OF A MINDSET", "OUT OF JAIL")
+      - break *before* a number that starts a quantity phrase, so the number
+        stays with its unit ("SHOPKEEPER 100 / RUPEES" → "A SHOPKEEPER" /
+        "100 RUPEES"); a number that *ends* a phrase ("rupees 100.") is left
+        attached to the word it follows
+    """
+    hard_cap = max_words + 2
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    for idx, w in enumerate(words):
+        text = _word_text(w)
+        if not text:
+            continue
+
+        # Break before a phrase-starting number: current cue closes first.
+        if current and _is_number_word(text) and not _ends_in_punct(text):
+            nxt = next(
+                (_word_text(n) for n in words[idx + 1:] if _word_text(n)), ""
+            )
+            prev_text = _word_text(current[-1])
+            if nxt and not _ends_in_punct(prev_text):
+                chunks.append(current)
+                current = []
+
+        current.append(w)
+
+        if _ends_in_punct(text):
+            chunks.append(current)
+            current = []
+        elif len(current) >= max_words:
+            # Extend through a function-word tail so the cue closes on a
+            # content word — but never past the hard cap.
+            if text.lower() in NO_TAIL_WORDS and len(current) < hard_cap:
+                continue
+            chunks.append(current)
+            current = []
+    if current:
+        chunks.append(current)
+    return chunks
+
 
 def _srt_timestamp(seconds: float) -> str:
     total_ms = int(round(seconds * 1000))
@@ -516,10 +584,12 @@ def build_master_srt(
     edit_dir: Path,
     out_path: Path,
     text_case: str = "upper",
+    max_words: int = 2,
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
-    - 2-word chunks (break on any punctuation in between)
+    - up-to-max_words chunks via chunk_caption_words (punctuation breaks,
+      no function-word tails, numbers kept with their units)
     - UPPERCASE text by default; natural preserves the Scribe transcript case
     - Output times computed as word.start - segment_start + segment_offset
     """
@@ -544,21 +614,7 @@ def build_master_srt(
         transcript = json.loads(tr_path.read_text())
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
-        # Group into 2-word chunks, break on punctuation
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        for w in words_in_seg:
-            text = (w.get("text") or "").strip()
-            if not text:
-                continue
-            current.append(w)
-            # Break if the current text ends in punctuation or we hit 2 words
-            ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
-            if len(current) >= 2 or ends_in_punct:
-                chunks.append(current)
-                current = []
-        if current:
-            chunks.append(current)
+        chunks = chunk_caption_words(words_in_seg, max_words=max_words)
 
         for chunk in chunks:
             local_start = max(seg_start, chunk[0].get("start", seg_start))
@@ -815,6 +871,12 @@ def main() -> None:
         help="Caption case when building subtitles (default: upper).",
     )
     ap.add_argument(
+        "--subtitle-max-words",
+        type=int,
+        default=2,
+        help="Max words per caption cue when building subtitles (default: 2).",
+    )
+    ap.add_argument(
         "--no-subtitles",
         action="store_true",
         help="Skip subtitles even if the EDL references one",
@@ -877,6 +939,8 @@ def main() -> None:
 
     if args.subtitle_font_size is not None and args.subtitle_font_size <= 0:
         ap.error("--subtitle-font-size must be > 0")
+    if args.subtitle_max_words < 1:
+        ap.error("--subtitle-max-words must be >= 1")
     if args.subtitle_margin_v is not None and args.subtitle_margin_v < 0:
         ap.error("--subtitle-margin-v must be >= 0")
     if args.subtitle_outline is not None and args.subtitle_outline < 0:
@@ -915,6 +979,7 @@ def main() -> None:
                 edit_dir,
                 subs_path,
                 text_case=args.subtitle_case,
+                max_words=args.subtitle_max_words,
             )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
