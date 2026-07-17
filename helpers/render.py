@@ -371,7 +371,7 @@ def extract_segment(
         preset, crf = "fast", "20"
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-nostdin", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
@@ -391,8 +391,14 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    work_dir: Path | None = None,
 ) -> list[Path]:
-    """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
+    """Extract every EDL range into the selected work directory.
+
+    Source paths remain relative to ``edit_dir`` (the EDL parent). When
+    ``work_dir`` is omitted, intermediates retain their historical locations
+    under ``edit_dir``.
+
     Returns the ordered list of segment paths.
 
     If the EDL `grade` is "auto", analyze each segment range with
@@ -402,7 +408,8 @@ def extract_all_segments(
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
     canvas = parse_canvas(edl.get("canvas"))
-    clips_dir = edit_dir / (
+    products_dir = work_dir if work_dir is not None else edit_dir
+    clips_dir = products_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -470,7 +477,7 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
     concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-nostdin", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
         "-c", "copy",
@@ -667,7 +674,7 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
         f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json"
     )
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-nostats",
         "-i", str(video_path),
         "-af", filter_str,
         "-vn", "-f", "null", "-",
@@ -708,7 +715,7 @@ def apply_loudnorm_two_pass(
         # One-pass approximation — faster, slightly less accurate.
         filter_str = f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            "ffmpeg", "-nostdin", "-y", "-hide_banner", "-nostats",
             "-i", str(input_path),
             "-c:v", "copy",
             "-af", filter_str,
@@ -740,7 +747,7 @@ def apply_loudnorm_two_pass(
         f":linear=true"
     )
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-nostats",
         "-i", str(input_path),
         "-c:v", "copy",
         "-af", filter_str,
@@ -774,7 +781,10 @@ def build_final_composite(
 
     if not has_overlays and not has_subs:
         # Nothing to do — just rename/copy base to final name
-        run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
+        run(
+            ["ffmpeg", "-nostdin", "-y", "-i", str(base_path), "-c", "copy", str(out_path)],
+            quiet=True,
+        )
         return
 
     inputs: list[str] = ["-i", str(base_path)]
@@ -824,7 +834,7 @@ def build_final_composite(
     filter_complex = ";".join(filter_parts)
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-nostdin", "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
@@ -849,6 +859,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
     ap.add_argument("-o", "--output", type=Path, required=True, help="Output video path")
+    ap.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for render intermediates and built master.srt. "
+            "Defaults to the EDL parent."
+        ),
+    )
     ap.add_argument(
         "--preview",
         action="store_true",
@@ -952,11 +971,17 @@ def main() -> None:
 
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
+    work_dir = args.work_dir.resolve() if args.work_dir is not None else edit_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output.resolve()
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl,
+        edit_dir,
+        preview=args.preview,
+        draft=args.draft,
+        work_dir=work_dir,
     )
 
     # 2. Concat → base
@@ -966,14 +991,14 @@ def main() -> None:
         base_name = "base_preview.mp4"
     else:
         base_name = "base.mp4"
-    base_path = edit_dir / base_name
-    concat_segments(segment_paths, base_path, edit_dir)
+    base_path = work_dir / base_name
+    concat_segments(segment_paths, base_path, work_dir)
 
     # 3. Subtitles: build if requested, resolve final path
     subs_path: Path | None = None
     if not args.no_subtitles:
         if args.build_subtitles:
-            subs_path = edit_dir / "master.srt"
+            subs_path = work_dir / "master.srt"
             build_master_srt(
                 edl,
                 edit_dir,
