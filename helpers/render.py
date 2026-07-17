@@ -763,6 +763,9 @@ def apply_loudnorm_two_pass(
 # -------- Final compositing (Rule 1 + Rule 4) -------------------------------
 
 
+STILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
 def build_final_composite(
     base_path: Path,
     overlays: list[dict],
@@ -790,7 +793,14 @@ def build_final_composite(
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
-        inputs += ["-i", str(ov_path)]
+        if ov_path.suffix.lower() in STILL_IMAGE_EXTS:
+            # Loop a still (e.g. a title card PNG) for the overlay window;
+            # slight tail margin so the enable window never outruns frames.
+            dur = float(ov["duration"]) + 0.5
+            inputs += ["-loop", "1", "-framerate", "24", "-t", f"{dur:.3f}",
+                       "-i", str(ov_path)]
+        else:
+            inputs += ["-i", str(ov_path)]
 
     filter_parts: list[str] = []
     # PTS-shift every overlay so its frame 0 lands at start_in_output
