@@ -501,6 +501,18 @@ NO_TAIL_WORDS = {
     "with", "at", "by", "from", "in", "on", "per", "than", "vs",
 }
 
+# Verbatim ASR keeps hesitations; captions usually shouldn't. Standalone
+# fillers and cut-off stutter fragments ("I-", "hi-") can be stripped from
+# cues with --subtitle-strip-fillers (audio is untouched).
+FILLER_TOKENS = {"uh", "um", "ah", "er", "erm"}
+
+
+def is_filler_word(text: str) -> bool:
+    t = text.strip().lower().strip("".join(PUNCT_BREAK) + '"')
+    if t in FILLER_TOKENS:
+        return True
+    return 1 < len(t) <= 4 and t.endswith("-")
+
 
 def _word_text(w: dict) -> str:
     return re.sub(r"\s+", " ", (w.get("text") or "")).strip()
@@ -592,6 +604,7 @@ def build_master_srt(
     out_path: Path,
     text_case: str = "upper",
     max_words: int = 2,
+    strip_fillers: bool = False,
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
@@ -620,6 +633,10 @@ def build_master_srt(
 
         transcript = json.loads(tr_path.read_text())
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
+        if strip_fillers:
+            words_in_seg = [
+                w for w in words_in_seg if not is_filler_word(_word_text(w))
+            ]
 
         chunks = chunk_caption_words(words_in_seg, max_words=max_words)
 
@@ -918,6 +935,12 @@ def main() -> None:
         help="Max words per caption cue when building subtitles (default: 2).",
     )
     ap.add_argument(
+        "--subtitle-strip-fillers",
+        action="store_true",
+        help="Drop hesitation fillers (uh/um/ah) and stutter fragments from "
+        "built captions. Audio is unchanged.",
+    )
+    ap.add_argument(
         "--no-subtitles",
         action="store_true",
         help="Skip subtitles even if the EDL references one",
@@ -1027,6 +1050,7 @@ def main() -> None:
                 subs_path,
                 text_case=args.subtitle_case,
                 max_words=args.subtitle_max_words,
+                strip_fillers=args.subtitle_strip_fillers,
             )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)

@@ -24,6 +24,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from render import is_filler_word  # same directory
+
 
 CANVAS = "1080x1920"
 
@@ -46,8 +48,18 @@ TAIL_PAD_S = 0.30
 SNAP_WINDOW_S = 0.15
 NEXT_WORD_CLEARANCE_S = 0.05
 EXCLUDE_GUARD_S = 0.06
+MIN_KEEP_S = 0.25  # keep-segments shorter than this merge into the cut
 MAX_RENDER_ATTEMPTS = 3  # initial render plus two fix attempts
 MAX_CUE_CHARS = 26
+
+# Alternating punch-in for filler jump-cuts: every other keep-segment uses a
+# ~5% tighter window (same 9:16 aspect) so the seam reads as an intentional
+# zoom beat instead of a stutter. Offsets keep the punched window centered
+# inside the normal one.
+PUNCH_CROP_W = 576
+PUNCH_CROP_H = 1024
+PUNCH_OFFSET_X = (CROP_WIDTH - PUNCH_CROP_W) // 2
+PUNCH_OFFSET_Y = (CROP_HEIGHT - PUNCH_CROP_H) // 2
 
 HERE = Path(__file__).resolve().parent
 RENDER_HELPER = HERE / "render.py"
@@ -114,6 +126,8 @@ def load_spec(path: Path) -> tuple[str, Path, list[dict[str, Any]]]:
             raise ValueError(f"{clip_id}.crop_x must be an integer") from exc
         if crop_x < 0 or crop_x + CROP_WIDTH > 1920:
             raise ValueError(f"{clip_id}: crop_x {crop_x} is outside the 1920px source")
+        if not isinstance(clip.get("cut_fillers", False), bool):
+            raise ValueError(f"{clip_id}.cut_fillers must be a boolean")
         title = clip.get("title")
         if title is not None:
             if (
@@ -247,9 +261,26 @@ def build_clip_edl(
 ) -> tuple[dict[str, Any], float, float]:
     snapped_start, snapped_end, _first_index, _last_index = snap_clip(clip, words)
     crop = f"{CROP_WIDTH}:{CROP_HEIGHT}:{int(clip['crop_x'])}:0"
-    excluded = find_excluded_word(clip, words)
+    punch_crop = (
+        f"{PUNCH_CROP_W}:{PUNCH_CROP_H}:"
+        f"{int(clip['crop_x']) + PUNCH_OFFSET_X}:{PUNCH_OFFSET_Y}"
+    )
 
-    if excluded is None:
+    excluded_intervals: list[tuple[float, float]] = []
+    excluded = find_excluded_word(clip, words)
+    if excluded is not None:
+        excluded_intervals.append((float(excluded["start"]), float(excluded["end"])))
+    cut_fillers = bool(clip.get("cut_fillers"))
+    if cut_fillers:
+        for word in words:
+            if (
+                snapped_start < float(word["start"])
+                and float(word["end"]) < snapped_end
+                and is_filler_word(str(word["text"]))
+            ):
+                excluded_intervals.append((float(word["start"]), float(word["end"])))
+
+    if not excluded_intervals:
         ranges = [
             {
                 "source": source_name,
@@ -259,23 +290,43 @@ def build_clip_edl(
             }
         ]
     else:
-        left_end = round(excluded["start"] - EXCLUDE_GUARD_S, 6)
-        right_start = round(excluded["end"] + EXCLUDE_GUARD_S, 6)
-        if not (snapped_start < left_end < right_start < snapped_end):
-            raise ValueError(f"{clip['id']}: excluded word guard falls outside the clip")
+        # Expand by the guard, merge overlaps, then keep the complement.
+        expanded = sorted(
+            (a - EXCLUDE_GUARD_S, b + EXCLUDE_GUARD_S) for a, b in excluded_intervals
+        )
+        merged: list[list[float]] = []
+        for a, b in expanded:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+
+        keeps: list[tuple[float, float]] = []
+        cursor = snapped_start
+        for a, b in merged:
+            if not (snapped_start < a and b < snapped_end):
+                raise ValueError(
+                    f"{clip['id']}: excluded interval {a:.3f}-{b:.3f} "
+                    "falls outside the clip"
+                )
+            if a - cursor >= MIN_KEEP_S:
+                keeps.append((cursor, a))
+            cursor = max(cursor, b)
+        if snapped_end - cursor >= MIN_KEEP_S:
+            keeps.append((cursor, snapped_end))
+        if not keeps:
+            raise ValueError(f"{clip['id']}: nothing left to keep after exclusions")
+
         ranges = [
             {
                 "source": source_name,
-                "start": snapped_start,
-                "end": left_end,
-                "crop": crop,
-            },
-            {
-                "source": source_name,
-                "start": right_start,
-                "end": snapped_end,
-                "crop": crop,
-            },
+                "start": round(a, 6),
+                "end": round(b, 6),
+                # Alternate punch-in only for filler cutting; a lone
+                # profanity excision keeps a uniform frame.
+                "crop": punch_crop if cut_fillers and i % 2 == 1 else crop,
+            }
+            for i, (a, b) in enumerate(keeps)
         ]
 
     total_duration = round(
@@ -336,7 +387,11 @@ def build_title_card(
 
 
 def render_clip(
-    edl: dict[str, Any], edit_dir: Path, work_dir: Path, output_path: Path
+    edl: dict[str, Any],
+    edit_dir: Path,
+    work_dir: Path,
+    output_path: Path,
+    strip_fillers: bool = False,
 ) -> None:
     fonts_dir = edit_dir / "fonts"
     staged_path: Path | None = None
@@ -376,6 +431,8 @@ def render_clip(
             "--subtitle-outline",
             "1",
         ]
+        if strip_fillers:
+            command.append("--subtitle-strip-fillers")
         subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
     finally:
         if staged_path is not None:
@@ -603,7 +660,10 @@ def process_clip(
             flush=True,
         )
         try:
-            render_clip(edl, edit_dir, work_dir, output_path)
+            render_clip(
+                edl, edit_dir, work_dir, output_path,
+                strip_fillers=bool(clip.get("cut_fillers")),
+            )
             last_qc = verify_render(
                 output_path,
                 work_dir / "master.srt",
