@@ -224,19 +224,16 @@ def _normalized_word(text: str) -> str:
     return re.sub(r"^\W+|\W+$", "", text, flags=re.UNICODE).casefold()
 
 
-def find_excluded_word(
-    clip: dict[str, Any], words: list[dict[str, Any]]
-) -> dict[str, Any] | None:
-    request = clip.get("exclude_words")
-    if request is None:
-        return None
+def locate_requested_word(
+    request: Any, words: list[dict[str, Any]], label: str
+) -> dict[str, Any]:
     if not isinstance(request, dict) or "text" not in request or "window" not in request:
-        raise ValueError(f"{clip['id']}: exclude_words requires text and window")
+        raise ValueError(f"{label} requires text and window")
     window = request["window"]
     if not isinstance(window, list) or len(window) != 2:
-        raise ValueError(f"{clip['id']}: exclude_words.window must have two values")
-    window_start = _as_float(window[0], f"{clip['id']}.exclude_words.window[0]")
-    window_end = _as_float(window[1], f"{clip['id']}.exclude_words.window[1]")
+        raise ValueError(f"{label}.window must have two values")
+    window_start = _as_float(window[0], f"{label}.window[0]")
+    window_end = _as_float(window[1], f"{label}.window[1]")
     target = _normalized_word(str(request["text"]))
     matches = [
         word
@@ -247,10 +244,19 @@ def find_excluded_word(
     ]
     if len(matches) != 1:
         raise ValueError(
-            f"{clip['id']}: expected one {request['text']!r} in "
+            f"{label}: expected one {request['text']!r} in "
             f"{window_start:g}-{window_end:g}, found {len(matches)}"
         )
     return matches[0]
+
+
+def find_excluded_word(
+    clip: dict[str, Any], words: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    request = clip.get("exclude_words")
+    if request is None:
+        return None
+    return locate_requested_word(request, words, f"{clip['id']}: exclude_words")
 
 
 def build_clip_edl(
@@ -341,6 +347,23 @@ def build_clip_edl(
         "subtitles": "master.srt",
         "total_duration_s": total_duration,
     }
+
+    # Caption-only skips: cross-talk words that overlap the primary speaker
+    # (can't be cut from audio) but shouldn't appear in captions.
+    skip_requests = clip.get("caption_skip_words") or []
+    if skip_requests:
+        if not isinstance(skip_requests, list):
+            raise ValueError(f"{clip['id']}: caption_skip_words must be a list")
+        intervals = []
+        for i, req in enumerate(skip_requests):
+            word = locate_requested_word(
+                req, words, f"{clip['id']}: caption_skip_words[{i}]"
+            )
+            intervals.append(
+                [round(float(word["start"]) - 0.01, 6), round(float(word["end"]) + 0.01, 6)]
+            )
+        edl["caption_skip"] = intervals
+
     return edl, snapped_start, snapped_end
 
 

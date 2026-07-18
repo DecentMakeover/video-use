@@ -511,7 +511,9 @@ def is_filler_word(text: str) -> bool:
     t = text.strip().lower().strip("".join(PUNCT_BREAK) + '"')
     if t in FILLER_TOKENS:
         return True
-    return 1 < len(t) <= 4 and t.endswith("-")
+    # Cut-off stutter fragments ("I-", "hi-") — alphabetic only, so numeric
+    # run-ons like "35%-" are never treated as fillers.
+    return 1 < len(t) <= 4 and t.endswith("-") and t[:-1].isalpha()
 
 
 def _word_text(w: dict) -> str:
@@ -637,6 +639,15 @@ def build_master_srt(
             words_in_seg = [
                 w for w in words_in_seg if not is_filler_word(_word_text(w))
             ]
+        # Caption-only exclusions ("caption_skip": [[t0, t1], ...] in source
+        # seconds) — e.g. sub-second cross-talk that overlaps the primary
+        # speaker and can't be cut from the audio.
+        skip_windows = edl.get("caption_skip") or []
+        if skip_windows:
+            def _skipped(w: dict) -> bool:
+                mid = (float(w.get("start", 0)) + float(w.get("end", 0))) / 2
+                return any(a <= mid <= b for a, b in skip_windows)
+            words_in_seg = [w for w in words_in_seg if not _skipped(w)]
 
         chunks = chunk_caption_words(words_in_seg, max_words=max_words)
 
