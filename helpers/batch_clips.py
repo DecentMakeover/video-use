@@ -98,7 +98,7 @@ def load_spec(path: Path) -> tuple[str, Path, list[dict[str, Any]]]:
     if not isinstance(data, list) or not data:
         raise ValueError("batch spec clips must be a non-empty JSON list")
 
-    required = {"id", "slug", "approx_start", "approx_end", "crop_x"}
+    required = {"id", "slug", "crop_x"}
     seen_ids: set[str] = set()
     seen_slugs: set[str] = set()
     for index, clip in enumerate(data):
@@ -116,10 +116,26 @@ def load_spec(path: Path) -> tuple[str, Path, list[dict[str, Any]]]:
         seen_ids.add(clip_id)
         seen_slugs.add(slug)
 
-        approx_start = _as_float(clip["approx_start"], f"{clip_id}.approx_start")
-        approx_end = _as_float(clip["approx_end"], f"{clip_id}.approx_end")
-        if approx_end <= approx_start:
-            raise ValueError(f"{clip_id}: approx_end must be after approx_start")
+        segments = clip.get("segments")
+        if segments is not None:
+            if not isinstance(segments, list) or len(segments) < 2:
+                raise ValueError(f"{clip_id}.segments must be a list of 2+ moments")
+            for i, seg in enumerate(segments):
+                if not isinstance(seg, dict) or "start" not in seg or "end" not in seg:
+                    raise ValueError(f"{clip_id}.segments[{i}] needs start and end")
+                a = _as_float(seg["start"], f"{clip_id}.segments[{i}].start")
+                b = _as_float(seg["end"], f"{clip_id}.segments[{i}].end")
+                if b <= a:
+                    raise ValueError(f"{clip_id}.segments[{i}]: end must follow start")
+        else:
+            if "approx_start" not in clip or "approx_end" not in clip:
+                raise ValueError(
+                    f"{clip_id}: needs approx_start/approx_end, or segments"
+                )
+            approx_start = _as_float(clip["approx_start"], f"{clip_id}.approx_start")
+            approx_end = _as_float(clip["approx_end"], f"{clip_id}.approx_end")
+            if approx_end <= approx_start:
+                raise ValueError(f"{clip_id}: approx_end must be after approx_start")
         try:
             crop_x = int(clip["crop_x"])
         except (TypeError, ValueError) as exc:
@@ -172,8 +188,19 @@ def snap_clip(
     clip: dict[str, Any], words: list[dict[str, Any]]
 ) -> tuple[float, float, int, int]:
     """Snap approximate boundaries to words, pads, and outward output frames."""
-    approx_start = float(clip["approx_start"])
-    approx_end = float(clip["approx_end"])
+    return snap_span(
+        float(clip["approx_start"]), float(clip["approx_end"]), words, str(clip["id"])
+    )
+
+
+def snap_span(
+    approx_start: float,
+    approx_end: float,
+    words: list[dict[str, Any]],
+    label: str,
+) -> tuple[float, float, int, int]:
+    """Word-snap one span. Shared by single-pull clips and montage segments."""
+    clip = {"id": label}
     start_floor = approx_start - SNAP_WINDOW_S
     end_ceiling = approx_end + SNAP_WINDOW_S
 
@@ -265,12 +292,53 @@ def build_clip_edl(
     source_name: str,
     source_path: Path,
 ) -> tuple[dict[str, Any], float, float]:
-    snapped_start, snapped_end, _first_index, _last_index = snap_clip(clip, words)
     crop = f"{CROP_WIDTH}:{CROP_HEIGHT}:{int(clip['crop_x'])}:0"
     punch_crop = (
         f"{PUNCH_CROP_W}:{PUNCH_CROP_H}:"
         f"{int(clip['crop_x']) + PUNCH_OFFSET_X}:{PUNCH_OFFSET_Y}"
     )
+
+    # Montage mode: several moments from different points in the episode,
+    # stitched into one argument. Each segment is word-snapped independently
+    # and gets its own crop_x (he drifts across the hour); the punch-in
+    # alternates so every jump in time reads as a deliberate beat.
+    montage = clip.get("segments")
+    if montage:
+        ranges = []
+        for i, seg in enumerate(montage):
+            a, b = float(seg["start"]), float(seg["end"])
+            s_start, s_end, _, _ = snap_span(a, b, words, f"{clip['id']}#{i}")
+            seg_x = int(seg.get("crop_x", clip["crop_x"]))
+            if i % 2 == 1:
+                seg_crop = (
+                    f"{PUNCH_CROP_W}:{PUNCH_CROP_H}:"
+                    f"{seg_x + PUNCH_OFFSET_X}:{PUNCH_OFFSET_Y}"
+                )
+            else:
+                seg_crop = f"{CROP_WIDTH}:{CROP_HEIGHT}:{seg_x}:0"
+            ranges.append({
+                "source": source_name,
+                "start": s_start,
+                "end": s_end,
+                "crop": seg_crop,
+                "beat": seg.get("beat", ""),
+            })
+        total_duration = round(
+            sum(float(r["end"]) - float(r["start"]) for r in ranges), 6
+        )
+        edl = {
+            "version": 1,
+            "canvas": CANVAS,
+            "sources": {source_name: str(source_path)},
+            "ranges": ranges,
+            "grade": "auto",
+            "subtitles": "master.srt",
+            "total_duration_s": total_duration,
+        }
+        attach_caption_skips(edl, clip, words)
+        return edl, float(ranges[0]["start"]), float(ranges[-1]["end"])
+
+    snapped_start, snapped_end, _first_index, _last_index = snap_clip(clip, words)
 
     excluded_intervals: list[tuple[float, float]] = []
     excluded = find_excluded_word(clip, words)
@@ -348,23 +416,29 @@ def build_clip_edl(
         "total_duration_s": total_duration,
     }
 
-    # Caption-only skips: cross-talk words that overlap the primary speaker
-    # (can't be cut from audio) but shouldn't appear in captions.
-    skip_requests = clip.get("caption_skip_words") or []
-    if skip_requests:
-        if not isinstance(skip_requests, list):
-            raise ValueError(f"{clip['id']}: caption_skip_words must be a list")
-        intervals = []
-        for i, req in enumerate(skip_requests):
-            word = locate_requested_word(
-                req, words, f"{clip['id']}: caption_skip_words[{i}]"
-            )
-            intervals.append(
-                [round(float(word["start"]) - 0.01, 6), round(float(word["end"]) + 0.01, 6)]
-            )
-        edl["caption_skip"] = intervals
-
+    attach_caption_skips(edl, clip, words)
     return edl, snapped_start, snapped_end
+
+
+def attach_caption_skips(
+    edl: dict[str, Any], clip: dict[str, Any], words: list[dict[str, Any]]
+) -> None:
+    """Caption-only skips: cross-talk words that overlap the primary speaker
+    (can't be cut from audio) but shouldn't appear in captions."""
+    skip_requests = clip.get("caption_skip_words") or []
+    if not skip_requests:
+        return
+    if not isinstance(skip_requests, list):
+        raise ValueError(f"{clip['id']}: caption_skip_words must be a list")
+    intervals = []
+    for i, req in enumerate(skip_requests):
+        word = locate_requested_word(
+            req, words, f"{clip['id']}: caption_skip_words[{i}]"
+        )
+        intervals.append(
+            [round(float(word["start"]) - 0.01, 6), round(float(word["end"]) + 0.01, 6)]
+        )
+    edl["caption_skip"] = intervals
 
 
 def write_json(path: Path, value: Any) -> None:
