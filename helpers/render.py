@@ -470,6 +470,82 @@ def extract_all_segments(
 # -------- Lossless concat ----------------------------------------------------
 
 
+def parse_transition(value: Any) -> tuple[str, float] | None:
+    """Parse an EDL `transition` spec into (xfade_name, duration_seconds).
+
+    Accepts {"type": "dissolve"|"fade"|<any xfade name>, "duration": 0.35}.
+    A transition overlaps neighbouring segments, so the output is shorter
+    than the sum of its ranges by (n_segments - 1) * duration.
+    """
+    if not value:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('EDL "transition" must be an object')
+    kind = str(value.get("type", "dissolve")).strip()
+    dur = float(value.get("duration", 0.35))
+    if dur <= 0:
+        raise ValueError("transition duration must be > 0")
+    # "dissolve" is our friendly alias for xfade's crossfade.
+    xfade_name = "fade" if kind in {"dissolve", "crossfade", "fade"} else kind
+    return xfade_name, dur
+
+
+def concat_with_transitions(
+    segment_paths: list[Path],
+    out_path: Path,
+    transition: tuple[str, float],
+    preview: bool = False,
+) -> None:
+    """Join segments with a crossfade (video xfade + audio acrossfade).
+
+    Unlike the lossless path this re-encodes, which a blend inherently
+    requires. Offsets are cumulative: each transition pulls every later
+    segment earlier by `duration`, so offset_k = sum(dur[0..k]) - (k+1)*dur.
+    """
+    xfade_name, dur = transition
+    durations = [video_duration(p) for p in segment_paths]
+    if any(d <= dur + 0.05 for d in durations):
+        raise ValueError(
+            f"a segment is too short for a {dur:.2f}s transition: {durations}"
+        )
+
+    inputs: list[str] = []
+    for p in segment_paths:
+        inputs += ["-i", str(p)]
+
+    parts: list[str] = []
+    v_prev, a_prev = "[0:v]", "[0:a]"
+    running = durations[0]
+    for i in range(1, len(segment_paths)):
+        offset = running - dur
+        v_out = f"[v{i}]" if i < len(segment_paths) - 1 else "[vout]"
+        a_out = f"[a{i}]" if i < len(segment_paths) - 1 else "[aout]"
+        parts.append(
+            f"{v_prev}[{i}:v]xfade=transition={xfade_name}:"
+            f"duration={dur:.3f}:offset={offset:.3f}{v_out}"
+        )
+        parts.append(
+            f"{a_prev}[{i}:a]acrossfade=d={dur:.3f}:c1=tri:c2=tri{a_out}"
+        )
+        v_prev, a_prev = v_out, a_out
+        running += durations[i] - dur
+
+    crf = "22" if preview else "20"
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        *inputs,
+        "-filter_complex", ";".join(parts),
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "medium", "-crf", crf,
+        "-pix_fmt", "yuv420p", "-r", "24",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    print(f"concat with {xfade_name} {dur:.2f}s → {out_path.name}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
 def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
     """Lossless concat via the concat demuxer. No re-encode."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,6 +683,7 @@ def build_master_srt(
     text_case: str = "upper",
     max_words: int = 2,
     strip_fillers: bool = False,
+    transition_overlap: float = 0.0,
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
@@ -630,7 +707,7 @@ def build_master_srt(
         tr_path = transcripts_dir / f"{src_name}.json"
         if not tr_path.exists():
             print(f"  no transcript for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration
+            seg_offset += seg_duration - transition_overlap
             continue
 
         transcript = json.loads(tr_path.read_text())
@@ -668,7 +745,7 @@ def build_master_srt(
                 raise ValueError(f"unsupported subtitle case: {text_case}")
             entries.append((out_start, out_end, text))
 
-        seg_offset += seg_duration
+        seg_offset += seg_duration - transition_overlap
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
@@ -1048,7 +1125,13 @@ def main() -> None:
     else:
         base_name = "base.mp4"
     base_path = work_dir / base_name
-    concat_segments(segment_paths, base_path, work_dir)
+    transition = parse_transition(edl.get("transition"))
+    if transition and len(segment_paths) > 1:
+        concat_with_transitions(
+            segment_paths, base_path, transition, preview=args.preview
+        )
+    else:
+        concat_segments(segment_paths, base_path, work_dir)
 
     # 3. Subtitles: build if requested, resolve final path
     subs_path: Path | None = None
@@ -1062,6 +1145,7 @@ def main() -> None:
                 text_case=args.subtitle_case,
                 max_words=args.subtitle_max_words,
                 strip_fillers=args.subtitle_strip_fillers,
+                transition_overlap=(transition[1] if transition else 0.0),
             )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)

@@ -335,6 +335,20 @@ def build_clip_edl(
             "subtitles": "master.srt",
             "total_duration_s": total_duration,
         }
+        # Montages jump across the episode; a short dissolve makes each jump
+        # read as a beat instead of a glitch. Opt out with "transition": null.
+        if "transition" in clip:
+            if clip["transition"]:
+                edl["transition"] = clip["transition"]
+        else:
+            edl["transition"] = {"type": "dissolve", "duration": 0.35}
+        # Each crossfade overlaps two segments, so the output is shorter than
+        # the sum of the ranges. Declare the real duration for the QC gate.
+        if edl.get("transition"):
+            overlap = float(edl["transition"].get("duration", 0.35))
+            edl["total_duration_s"] = round(
+                total_duration - overlap * (len(ranges) - 1), 6
+            )
         attach_caption_skips(edl, clip, words)
         return edl, float(ranges[0]["start"]), float(ranges[-1]["end"])
 
