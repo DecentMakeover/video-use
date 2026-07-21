@@ -891,6 +891,17 @@ def apply_loudnorm_two_pass(
 STILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
+def probe_video_codec(video: Path) -> str:
+    """Codec name of a video's first video stream (for decoder selection)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
 def video_duration(video: Path) -> float:
     """Container duration of a rendered video, in seconds."""
     out = subprocess.run(
@@ -929,7 +940,14 @@ def build_final_composite(
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
-        if ov_path.suffix.lower() in STILL_IMAGE_EXTS:
+        if ov_path.suffix.lower() == ".webm":
+            # VP8/VP9 alpha lives in a side data plane that ffmpeg's default
+            # decoders drop — the overlay would then composite as opaque
+            # black over the base. libvpx/libvpx-vp9 decode it properly.
+            codec = probe_video_codec(ov_path)
+            decoder = "libvpx-vp9" if codec == "vp9" else "libvpx"
+            inputs += ["-c:v", decoder, "-i", str(ov_path)]
+        elif ov_path.suffix.lower() in STILL_IMAGE_EXTS:
             # Loop a still (e.g. a title card PNG) so it covers its overlay
             # window; cut the looped stream to exactly the base duration so
             # it can neither extend the composite past the base video nor
