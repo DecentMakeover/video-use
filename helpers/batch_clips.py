@@ -49,6 +49,11 @@ SNAP_WINDOW_S = 0.15
 NEXT_WORD_CLEARANCE_S = 0.05
 EXCLUDE_GUARD_S = 0.06
 MIN_KEEP_S = 0.25  # keep-segments shorter than this merge into the cut
+# Silence trimming: a pause longer than SILENCE_MIN_GAP_S between two spoken
+# words is shortened to SILENCE_KEEP_S so speech keeps a natural beat without
+# dead air. Trims are hard cuts inside a moment (never crossfaded).
+SILENCE_MIN_GAP_S = 0.45
+SILENCE_KEEP_S = 0.16
 MAX_RENDER_ATTEMPTS = 3  # initial render plus two fix attempts
 MAX_CUE_CHARS = 26
 
@@ -286,6 +291,44 @@ def find_excluded_word(
     return locate_requested_word(request, words, f"{clip['id']}: exclude_words")
 
 
+def trim_silences(
+    start: float,
+    end: float,
+    words: list[dict[str, Any]],
+    min_gap: float = SILENCE_MIN_GAP_S,
+    keep: float = SILENCE_KEEP_S,
+) -> list[tuple[float, float]]:
+    """Split [start, end] into keep-ranges with long inter-word pauses removed.
+
+    Returns [(a, b), ...] covering the span minus the excess silence. A pause
+    is shortened to `keep` seconds rather than removed outright, so the speech
+    still breathes; sub-frame trims are skipped as not worth a cut.
+    """
+    inner = [w for w in words if w["end"] > start and w["start"] < end]
+    cuts: list[tuple[float, float]] = []
+    for a, b in zip(inner, inner[1:]):
+        gap = float(b["start"]) - float(a["end"])
+        if gap < min_gap:
+            continue
+        excess = gap - keep
+        if excess < 0.12:
+            continue
+        cut_a = float(a["end"]) + keep / 2
+        cut_b = float(b["start"]) - keep / 2
+        if cut_b > cut_a:
+            cuts.append((cut_a, cut_b))
+
+    keeps: list[tuple[float, float]] = []
+    cursor = start
+    for c0, c1 in cuts:
+        if c0 - cursor >= MIN_KEEP_S:
+            keeps.append((cursor, c0))
+        cursor = max(cursor, c1)
+    if end - cursor >= MIN_KEEP_S:
+        keeps.append((cursor, end))
+    return keeps or [(start, end)]
+
+
 def build_clip_edl(
     clip: dict[str, Any],
     words: list[dict[str, Any]],
@@ -316,15 +359,25 @@ def build_clip_edl(
                 )
             else:
                 seg_crop = f"{CROP_WIDTH}:{CROP_HEIGHT}:{seg_x}:0"
-            ranges.append({
-                "source": source_name,
-                "start": s_start,
-                "end": s_end,
-                "crop": seg_crop,
-                "beat": seg.get("beat", ""),
-            })
+            spans = (
+                trim_silences(s_start, s_end, words)
+                if clip.get("trim_silences", True)
+                else [(s_start, s_end)]
+            )
+            for j, (a2, b2) in enumerate(spans):
+                ranges.append({
+                    "source": source_name,
+                    "start": round(a2, 6),
+                    "end": round(b2, 6),
+                    "crop": seg_crop,
+                    "group": i,
+                    "beat": seg.get("beat", "") if j == 0 else "",
+                })
+        # Each range is encoded independently at OUTPUT_FPS, so its duration
+        # rounds up to a whole frame. With many silence-trim sub-ranges that
+        # rounding accumulates, so predict it here instead of the raw sum.
         total_duration = round(
-            sum(float(r["end"]) - float(r["start"]) for r in ranges), 6
+            sum(_ceil_frame(float(r["end"]) - float(r["start"])) for r in ranges), 6
         )
         edl = {
             "version": 1,
@@ -346,8 +399,9 @@ def build_clip_edl(
         # the sum of the ranges. Declare the real duration for the QC gate.
         if edl.get("transition"):
             overlap = float(edl["transition"].get("duration", 0.35))
+            n_groups = len({r.get("group") for r in ranges})
             edl["total_duration_s"] = round(
-                total_duration - overlap * (len(ranges) - 1), 6
+                total_duration - overlap * (n_groups - 1), 6
             )
         attach_caption_skips(edl, clip, words)
         return edl, float(ranges[0]["start"]), float(ranges[-1]["end"])

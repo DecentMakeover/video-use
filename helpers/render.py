@@ -676,6 +676,26 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
     return out
 
 
+def _overlap_after(edl: dict, current: dict, overlap: float) -> float:
+    """Transition overlap that follows `current`, or 0 inside a group.
+
+    Ranges sharing a "group" are hard-cut together, so only the last range of
+    a group is followed by a crossfade that pulls later captions earlier.
+    """
+    if overlap <= 0:
+        return 0.0
+    ranges = edl["ranges"]
+    try:
+        i = ranges.index(current)
+    except ValueError:
+        return overlap
+    if i + 1 >= len(ranges):
+        return 0.0
+    g_now = ranges[i].get("group", i)
+    g_next = ranges[i + 1].get("group", i + 1)
+    return overlap if g_now != g_next else 0.0
+
+
 def build_master_srt(
     edl: dict,
     edit_dir: Path,
@@ -707,7 +727,7 @@ def build_master_srt(
         tr_path = transcripts_dir / f"{src_name}.json"
         if not tr_path.exists():
             print(f"  no transcript for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration - transition_overlap
+            seg_offset += seg_duration - _overlap_after(edl, r, transition_overlap)
             continue
 
         transcript = json.loads(tr_path.read_text())
@@ -745,7 +765,7 @@ def build_master_srt(
                 raise ValueError(f"unsupported subtitle case: {text_case}")
             entries.append((out_start, out_end, text))
 
-        seg_offset += seg_duration - transition_overlap
+        seg_offset += seg_duration - _overlap_after(edl, r, transition_overlap)
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
@@ -1126,7 +1146,25 @@ def main() -> None:
         base_name = "base.mp4"
     base_path = work_dir / base_name
     transition = parse_transition(edl.get("transition"))
-    if transition and len(segment_paths) > 1:
+    groups = [r.get("group", i) for i, r in enumerate(edl["ranges"])]
+    n_groups = len(dict.fromkeys(groups))
+    if transition and n_groups > 1:
+        # Ranges sharing a group are one continuous moment: hard-cut them
+        # together first (silence trims must stay invisible), then crossfade
+        # only the joins between moments.
+        group_files: list[Path] = []
+        for gi, gid in enumerate(dict.fromkeys(groups)):
+            members = [p for p, g in zip(segment_paths, groups) if g == gid]
+            if len(members) == 1:
+                group_files.append(members[0])
+            else:
+                gpath = work_dir / f"_group_{gi:02d}.mp4"
+                concat_segments(members, gpath, work_dir)
+                group_files.append(gpath)
+        concat_with_transitions(
+            group_files, base_path, transition, preview=args.preview
+        )
+    elif transition and len(segment_paths) > 1:
         concat_with_transitions(
             segment_paths, base_path, transition, preview=args.preview
         )
