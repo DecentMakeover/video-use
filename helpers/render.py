@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -254,6 +255,34 @@ def source_fps(video: Path) -> str:
     return out.stdout.strip().splitlines()[0]
 
 
+def videotoolbox_encoder_args(
+    *,
+    preview: bool = False,
+    draft: bool = False,
+    long_edge: int | None = None,
+    bitrate_mbps: int | None = None,
+) -> list[str]:
+    """Return VideoToolbox H.264 rate-control arguments for the render mode."""
+    if bitrate_mbps is not None:
+        bitrate = bitrate_mbps
+        maxrate = math.ceil(bitrate_mbps * 1.5)
+    elif draft:
+        bitrate, maxrate = 4, 6
+    elif long_edge is not None and long_edge >= 3840:
+        bitrate, maxrate = 35, 45
+    elif preview:
+        bitrate, maxrate = 8, 12
+    else:
+        bitrate, maxrate = 16, 24
+
+    return [
+        "-c:v", "h264_videotoolbox",
+        "-b:v", f"{bitrate}M",
+        "-maxrate", f"{maxrate}M",
+        "-profile:v", "high",
+    ]
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -266,6 +295,10 @@ def extract_segment(
     crf: int | None = None,
     fade_in: float = 0.0,
     fade_out: float = 0.0,
+    encoder: str = "libx264",
+    vt_bitrate: int | None = None,
+    hwdecode: bool = False,
+    long_edge: int | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -292,10 +325,12 @@ def extract_segment(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+    target_long_edge = long_edge if long_edge is not None else (1280 if draft else 1920)
+    scale = (
+        f"scale=-2:{target_long_edge}"
+        if portrait
+        else f"scale={target_long_edge}:-2"
+    )
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
@@ -324,14 +359,33 @@ def extract_segment(
         preset, default_crf = "fast", "20"
     crf_value = str(crf) if crf is not None else default_crf
 
+    if encoder == "videotoolbox":
+        video_encoder_args = videotoolbox_encoder_args(
+            preview=preview,
+            draft=draft,
+            long_edge=target_long_edge,
+            bitrate_mbps=vt_bitrate,
+        )
+    elif encoder == "libx264":
+        video_encoder_args = [
+            "-c:v", "libx264", "-preset", preset, "-crf", crf_value,
+        ]
+    else:
+        raise ValueError(f"unsupported encoder: {encoder}")
+
+    # VideoToolbox decode returns software frames unless an explicit hardware
+    # output format is requested, so the existing CPU filter graph remains valid.
+    hwdecode_args = ["-hwaccel", "videotoolbox"] if hwdecode else []
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
+        *hwdecode_args,
         "-i", str(source),
         "-t", f"{duration:.3f}",
         "-vf", vf,
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf_value,
+        *video_encoder_args,
         "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
@@ -347,6 +401,10 @@ def extract_all_segments(
     draft: bool = False,
     fps: str = "24",
     crf: int | None = None,
+    encoder: str = "libx264",
+    vt_bitrate: int | None = None,
+    hwdecode: bool = False,
+    long_edge: int | None = None,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -403,6 +461,8 @@ def extract_all_segments(
             src_path, start, duration, seg_filter, out_path,
             preview=preview, draft=draft, fps=seg_fps, crf=crf,
             fade_in=fade_in, fade_out=fade_out,
+            encoder=encoder, vt_bitrate=vt_bitrate, hwdecode=hwdecode,
+            long_edge=long_edge,
         )
         seg_paths.append(out_path)
 
@@ -656,6 +716,11 @@ def build_final_composite(
     out_path: Path,
     edit_dir: Path,
     subtitle_force_style: str | None = None,
+    encoder: str = "libx264",
+    preview: bool = False,
+    draft: bool = False,
+    long_edge: int | None = None,
+    vt_bitrate: int | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -711,13 +776,27 @@ def build_final_composite(
 
     filter_complex = ";".join(filter_parts)
 
+    if encoder == "videotoolbox":
+        video_encoder_args = videotoolbox_encoder_args(
+            preview=preview,
+            draft=draft,
+            long_edge=long_edge,
+            bitrate_mbps=vt_bitrate,
+        )
+    elif encoder == "libx264":
+        video_encoder_args = [
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        ]
+    else:
+        raise ValueError(f"unsupported encoder: {encoder}")
+
     cmd = [
         "ffmpeg", "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
         "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *video_encoder_args,
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
@@ -762,6 +841,31 @@ def main() -> None:
         help="Override libx264 CRF for segment extraction (default: 20 final / "
         "22 preview / 28 draft). Lower = higher quality; 17-18 is visually "
         "lossless for delivery masters.",
+    )
+    ap.add_argument(
+        "--encoder",
+        choices=("libx264", "videotoolbox"),
+        default="libx264",
+        help="Video encoder (default: libx264). videotoolbox is opt-in hardware H.264.",
+    )
+    ap.add_argument(
+        "--vt-bitrate",
+        type=int,
+        default=None,
+        metavar="M",
+        help="Override VideoToolbox bitrate in Mbit/s; maxrate is set to 1.5x.",
+    )
+    ap.add_argument(
+        "--hwdecode",
+        action="store_true",
+        help="Opt in to VideoToolbox decode acceleration for segment inputs.",
+    )
+    ap.add_argument(
+        "--long-edge",
+        type=int,
+        default=None,
+        metavar="PIXELS",
+        help="Override output long edge (default: 1920, or 1280 in draft mode).",
     )
     ap.add_argument(
         "--build-subtitles",
@@ -823,6 +927,14 @@ def main() -> None:
         ap.error("--subtitle-margin-v must be >= 0")
     if args.subtitle_outline is not None and args.subtitle_outline < 0:
         ap.error("--subtitle-outline must be >= 0")
+    if args.long_edge is not None and args.long_edge <= 0:
+        ap.error("--long-edge must be > 0")
+    if args.vt_bitrate is not None and args.vt_bitrate <= 0:
+        ap.error("--vt-bitrate must be > 0")
+    if args.vt_bitrate is not None and args.encoder != "videotoolbox":
+        ap.error("--vt-bitrate requires --encoder videotoolbox")
+    if args.crf is not None and args.encoder == "videotoolbox":
+        ap.error("--crf is only supported with --encoder libx264")
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -836,6 +948,8 @@ def main() -> None:
     segment_paths = extract_all_segments(
         edl, edit_dir, preview=args.preview, draft=args.draft,
         fps=args.fps, crf=args.crf,
+        encoder=args.encoder, vt_bitrate=args.vt_bitrate,
+        hwdecode=args.hwdecode, long_edge=args.long_edge,
     )
 
     # 2. Concat → base
@@ -879,13 +993,17 @@ def main() -> None:
     if args.no_loudnorm:
         # Composite directly to final output
         build_final_composite(
-            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style
+            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style,
+            encoder=args.encoder, preview=args.preview, draft=args.draft,
+            long_edge=args.long_edge, vt_bitrate=args.vt_bitrate,
         )
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
         build_final_composite(
-            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style
+            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style,
+            encoder=args.encoder, preview=args.preview, draft=args.draft,
+            long_edge=args.long_edge, vt_bitrate=args.vt_bitrate,
         )
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)

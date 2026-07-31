@@ -64,6 +64,83 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.03", audio_filter)
         self.assertIn("afade=t=out:st=1.970:d=0.03", audio_filter)
 
+    def test_default_segment_command_is_byte_for_byte_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "segment.mp4"
+            with (
+                patch.object(render, "is_portrait_source", return_value=False),
+                patch.object(render, "is_hdr_source", return_value=False),
+                patch.object(render.subprocess, "run") as run,
+            ):
+                render.extract_segment(
+                    Path("source.mp4"),
+                    seg_start=1.25,
+                    duration=2.0,
+                    grade_filter="",
+                    out_path=output,
+                )
+
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "ffmpeg", "-y", "-ss", "1.250", "-i", "source.mp4",
+                    "-t", "2.000", "-vf", "scale=1920:-2",
+                    "-af",
+                    "afade=t=in:st=0:d=0.030,afade=t=out:st=1.970:d=0.030",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-r", "24",
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                    "-movflags", "+faststart", str(output),
+                ],
+            )
+
+    def test_videotoolbox_segment_uses_bitrate_and_optional_hwdecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "segment.mp4"
+            with (
+                patch.object(render, "is_portrait_source", return_value=False),
+                patch.object(render, "is_hdr_source", return_value=False),
+                patch.object(render.subprocess, "run") as run,
+            ):
+                render.extract_segment(
+                    Path("source.mp4"),
+                    seg_start=0.0,
+                    duration=2.0,
+                    grade_filter="",
+                    out_path=output,
+                    preview=True,
+                    encoder="videotoolbox",
+                    hwdecode=True,
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("-c:v") : command.index("-profile:v") + 2],
+            [
+                "-c:v", "h264_videotoolbox",
+                "-b:v", "8M",
+                "-maxrate", "12M",
+                "-profile:v", "high",
+            ],
+        )
+        self.assertEqual(command[command.index("-vf") + 1], "scale=1920:-2")
+        self.assertLess(command.index("-hwaccel"), command.index("-i"))
+        self.assertNotIn("-crf", command)
+        self.assertNotIn("-preset", command)
+
+    def test_videotoolbox_bitrate_ladder_and_override(self) -> None:
+        self.assertIn("4M", render.videotoolbox_encoder_args(draft=True))
+        self.assertIn("8M", render.videotoolbox_encoder_args(preview=True))
+        self.assertIn("16M", render.videotoolbox_encoder_args())
+        self.assertEqual(
+            render.videotoolbox_encoder_args(long_edge=3840)[2:6],
+            ["-b:v", "35M", "-maxrate", "45M"],
+        )
+        self.assertEqual(
+            render.videotoolbox_encoder_args(bitrate_mbps=9)[2:6],
+            ["-b:v", "9M", "-maxrate", "14M"],
+        )
+
     def test_fps_and_crf_overrides_reach_the_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "segment.mp4"
@@ -204,6 +281,35 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("setpts=PTS-STARTPTS+1.5/TB", filter_graph)
         self.assertIn("overlay=enable='between(t,1.500,3.500)'", filter_graph)
         self.assertGreater(filter_graph.rfind("subtitles="), filter_graph.rfind("overlay="))
+
+    def test_videotoolbox_final_composite_uses_hardware_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            edit_dir = Path(tmp)
+            base = edit_dir / "base.mp4"
+            overlay = edit_dir / "overlay.mp4"
+            subtitles = edit_dir / "master.srt"
+            output = edit_dir / "final.mp4"
+            for path in (base, overlay, subtitles):
+                path.touch()
+
+            with patch.object(render.subprocess, "run") as run:
+                render.build_final_composite(
+                    base,
+                    [{"file": "overlay.mp4", "start_in_output": 0.0, "duration": 1.0}],
+                    subtitles,
+                    output,
+                    edit_dir,
+                    encoder="videotoolbox",
+                    long_edge=3840,
+                    subtitle_force_style="FontName=Helvetica",
+                )
+
+        command = run.call_args.args[0]
+        self.assertIn("h264_videotoolbox", command)
+        self.assertEqual(command[command.index("-b:v") + 1], "35M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "45M")
+        self.assertNotIn("libx264", command)
+
 
 
 class TranscriptTimelineTests(unittest.TestCase):
