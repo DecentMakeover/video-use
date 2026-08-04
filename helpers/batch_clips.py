@@ -347,6 +347,10 @@ def build_clip_edl(
     # alternates so every jump in time reads as a deliberate beat.
     montage = clip.get("segments")
     if montage:
+        if clip.get("cold_open") is not None:
+            raise ValueError(
+                f"{clip['id']}: cold_open is currently supported only for a single moment"
+            )
         ranges = []
         for i, seg in enumerate(montage):
             a, b = float(seg["start"]), float(seg["end"])
@@ -483,6 +487,80 @@ def build_clip_edl(
         "subtitles": "master.srt",
         "total_duration_s": total_duration,
     }
+
+    # Optional payoff-first spoken hook. The teaser is one group; the complete
+    # short (including filler/silence cuts) is a second group. Bridge mode is
+    # the default because a spoken hook must finish before its visual reset,
+    # rather than losing its last words under a normal overlapping xfade.
+    cold_open = clip.get("cold_open")
+    if cold_open is not None:
+        if not isinstance(cold_open, dict):
+            raise ValueError(f"{clip['id']}.cold_open must be an object")
+        if "start" not in cold_open or "end" not in cold_open:
+            raise ValueError(f"{clip['id']}.cold_open needs start and end")
+        cold_start, cold_end, _, _ = snap_span(
+            _as_float(cold_open["start"], f"{clip['id']}.cold_open.start"),
+            _as_float(cold_open["end"], f"{clip['id']}.cold_open.end"),
+            words,
+            f"{clip['id']}#cold_open",
+        )
+        # Use only when transcript snapping cannot express a clean out point
+        # between tightly adjacent words. The explicit source boundary is
+        # rounded outward to the output frame grid.
+        if cold_open.get("end_exact") is not None:
+            cold_end = _ceil_frame(
+                _as_float(
+                    cold_open["end_exact"],
+                    f"{clip['id']}.cold_open.end_exact",
+                )
+            )
+            if cold_end <= cold_start:
+                raise ValueError(f"{clip['id']}: cold_open.end_exact precedes start")
+        cold_x = int(cold_open.get("crop_x", clip["crop_x"]))
+        if cold_x < 0 or cold_x + CROP_WIDTH > 1920:
+            raise ValueError(
+                f"{clip['id']}: cold_open crop_x {cold_x} is outside the 1920px source"
+            )
+        cold_punch = bool(cold_open.get("punch_in", False))
+        cold_crop = (
+            f"{PUNCH_CROP_W}:{PUNCH_CROP_H}:"
+            f"{cold_x + PUNCH_OFFSET_X}:{PUNCH_OFFSET_Y}"
+            if cold_punch
+            else f"{CROP_WIDTH}:{CROP_HEIGHT}:{cold_x}:0"
+        )
+        teaser_range = {
+            "source": source_name,
+            "start": round(cold_start, 6),
+            "end": round(cold_end, 6),
+            "crop": cold_crop,
+            "group": 0,
+            "beat": str(cold_open.get("beat", "cold-open payoff")),
+        }
+        for item in ranges:
+            item["group"] = 1
+        edl["ranges"] = [teaser_range, *ranges]
+        transition = cold_open.get(
+            "transition", {"type": "fadeblack", "duration": 0.25}
+        )
+        if transition:
+            transition = dict(transition)
+            transition.setdefault("mode", "bridge")
+            edl["transition"] = transition
+        encoded_total = sum(
+            _ceil_frame(float(item["end"]) - float(item["start"]))
+            for item in edl["ranges"]
+        )
+        transition_duration = (
+            float(transition.get("duration", 0.25)) if transition else 0.0
+        )
+        if transition and transition.get("mode") == "bridge":
+            edl["total_duration_s"] = round(
+                encoded_total + transition_duration, 6
+            )
+        else:
+            edl["total_duration_s"] = round(
+                encoded_total - transition_duration, 6
+            )
 
     attach_caption_skips(edl, clip, words)
     return edl, snapped_start, snapped_end
