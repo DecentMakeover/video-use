@@ -474,8 +474,9 @@ def parse_transition(value: Any) -> tuple[str, float] | None:
     """Parse an EDL `transition` spec into (xfade_name, duration_seconds).
 
     Accepts {"type": "dissolve"|"fade"|<any xfade name>, "duration": 0.35}.
-    A transition overlaps neighbouring segments, so the output is shorter
-    than the sum of its ranges by (n_segments - 1) * duration.
+    The default ``mode: overlap`` shortens output by one duration per join.
+    ``mode: bridge`` is handled by the caller and inserts the transition after
+    a complete first moment instead.
     """
     if not value:
         return None
@@ -543,6 +544,78 @@ def concat_with_transitions(
         str(out_path),
     ]
     print(f"concat with {xfade_name} {dur:.2f}s → {out_path.name}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def concat_with_bridge_transition(
+    segment_paths: list[Path],
+    out_path: Path,
+    transition: tuple[str, float],
+    preview: bool = False,
+) -> None:
+    """Insert a transition between two complete moments.
+
+    Normal xfade overlaps the final ``duration`` seconds of the first moment,
+    which is appropriate for montage edits but can obscure the last words of a
+    spoken cold open. Bridge mode preserves both moments in full and inserts a
+    silent transition made from their boundary frames between them.
+    """
+    if len(segment_paths) != 2:
+        raise ValueError("bridge transitions currently require exactly two groups")
+
+    xfade_name, dur = transition
+    durations = [video_duration(p) for p in segment_paths]
+    if any(d <= 0.15 for d in durations):
+        raise ValueError(f"a segment is too short for a bridge transition: {durations}")
+
+    handle = min(0.05, durations[0] / 2, durations[1] / 2)
+    fade = min(0.08, durations[0] / 3, durations[1] / 3)
+    first_fade_start = max(0.0, durations[0] - fade)
+    parts = [
+        "[0:v]split=2[v0main][v0tail]",
+        "[1:v]split=2[v1main][v1head]",
+        "[v0main]setpts=PTS-STARTPTS[v0]",
+        "[v1main]setpts=PTS-STARTPTS[v1]",
+        (
+            f"[v0tail]trim=start={max(0.0, durations[0] - handle):.6f}:"
+            f"end={durations[0]:.6f},setpts=PTS-STARTPTS,"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps=24,format=yuv420p[vt0]"
+        ),
+        (
+            f"[v1head]trim=start=0:end={handle:.6f},setpts=PTS-STARTPTS,"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps=24,format=yuv420p[vt1]"
+        ),
+        (
+            f"[vt0][vt1]xfade=transition={xfade_name}:duration={dur:.3f}:offset=0,"
+            f"trim=duration={dur:.3f},setpts=PTS-STARTPTS[vbridge]"
+        ),
+        "[v0][vbridge][v1]concat=n=3:v=1:a=0[vout]",
+        (
+            "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"afade=t=out:st={first_fade_start:.6f}:d={fade:.3f},"
+            "asetpts=PTS-STARTPTS[a0]"
+        ),
+        f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[asil]",
+        (
+            "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"afade=t=in:st=0:d={fade:.3f},asetpts=PTS-STARTPTS[a1]"
+        ),
+        "[a0][asil][a1]concat=n=3:v=0:a=1[aout]",
+    ]
+
+    crf = "22" if preview else "20"
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(segment_paths[0]), "-i", str(segment_paths[1]),
+        "-filter_complex", ";".join(parts),
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "medium", "-crf", crf,
+        "-pix_fmt", "yuv420p", "-r", "24",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    print(f"concat with inserted {xfade_name} {dur:.2f}s → {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -676,24 +749,30 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
     return out
 
 
-def _overlap_after(edl: dict, current: dict, overlap: float) -> float:
-    """Transition overlap that follows `current`, or 0 inside a group.
-
-    Ranges sharing a "group" are hard-cut together, so only the last range of
-    a group is followed by a crossfade that pulls later captions earlier.
-    """
-    if overlap <= 0:
+def _transition_after(edl: dict, current: dict, amount: float) -> float:
+    """Transition time after ``current``, or 0 for ranges within one group."""
+    if amount <= 0:
         return 0.0
     ranges = edl["ranges"]
     try:
         i = ranges.index(current)
     except ValueError:
-        return overlap
+        return amount
     if i + 1 >= len(ranges):
         return 0.0
     g_now = ranges[i].get("group", i)
     g_next = ranges[i + 1].get("group", i + 1)
-    return overlap if g_now != g_next else 0.0
+    return amount if g_now != g_next else 0.0
+
+
+def _overlap_after(edl: dict, current: dict, overlap: float) -> float:
+    """Crossfade overlap following ``current`` (zero inside a group)."""
+    return _transition_after(edl, current, overlap)
+
+
+def _gap_after(edl: dict, current: dict, gap: float) -> float:
+    """Inserted bridge duration following ``current`` (zero inside a group)."""
+    return _transition_after(edl, current, gap)
 
 
 def build_master_srt(
@@ -704,6 +783,7 @@ def build_master_srt(
     max_words: int = 2,
     strip_fillers: bool = False,
     transition_overlap: float = 0.0,
+    transition_gap: float = 0.0,
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
@@ -727,7 +807,11 @@ def build_master_srt(
         tr_path = transcripts_dir / f"{src_name}.json"
         if not tr_path.exists():
             print(f"  no transcript for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration - _overlap_after(edl, r, transition_overlap)
+            seg_offset += (
+                seg_duration
+                - _overlap_after(edl, r, transition_overlap)
+                + _gap_after(edl, r, transition_gap)
+            )
             continue
 
         transcript = json.loads(tr_path.read_text())
@@ -765,7 +849,11 @@ def build_master_srt(
                 raise ValueError(f"unsupported subtitle case: {text_case}")
             entries.append((out_start, out_end, text))
 
-        seg_offset += seg_duration - _overlap_after(edl, r, transition_overlap)
+        seg_offset += (
+            seg_duration
+            - _overlap_after(edl, r, transition_overlap)
+            + _gap_after(edl, r, transition_gap)
+        )
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
@@ -1163,7 +1251,15 @@ def main() -> None:
     else:
         base_name = "base.mp4"
     base_path = work_dir / base_name
-    transition = parse_transition(edl.get("transition"))
+    transition_spec = edl.get("transition") or {}
+    transition = parse_transition(transition_spec)
+    transition_mode = (
+        str(transition_spec.get("mode", "overlap")).strip().lower()
+        if isinstance(transition_spec, dict)
+        else "overlap"
+    )
+    if transition_mode not in {"overlap", "bridge"}:
+        raise ValueError(f"unsupported transition mode: {transition_mode}")
     groups = [r.get("group", i) for i, r in enumerate(edl["ranges"])]
     n_groups = len(dict.fromkeys(groups))
     if transition and n_groups > 1:
@@ -1179,9 +1275,14 @@ def main() -> None:
                 gpath = work_dir / f"_group_{gi:02d}.mp4"
                 concat_segments(members, gpath, work_dir)
                 group_files.append(gpath)
-        concat_with_transitions(
-            group_files, base_path, transition, preview=args.preview
-        )
+        if transition_mode == "bridge":
+            concat_with_bridge_transition(
+                group_files, base_path, transition, preview=args.preview
+            )
+        else:
+            concat_with_transitions(
+                group_files, base_path, transition, preview=args.preview
+            )
     elif transition and len(segment_paths) > 1:
         concat_with_transitions(
             segment_paths, base_path, transition, preview=args.preview
@@ -1201,7 +1302,16 @@ def main() -> None:
                 text_case=args.subtitle_case,
                 max_words=args.subtitle_max_words,
                 strip_fillers=args.subtitle_strip_fillers,
-                transition_overlap=(transition[1] if transition else 0.0),
+                transition_overlap=(
+                    transition[1]
+                    if transition and transition_mode == "overlap"
+                    else 0.0
+                ),
+                transition_gap=(
+                    transition[1]
+                    if transition and transition_mode == "bridge"
+                    else 0.0
+                ),
             )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)

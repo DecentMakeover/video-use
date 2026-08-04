@@ -13,6 +13,7 @@ HELPERS = ROOT / "helpers"
 sys.path.insert(0, str(HELPERS))
 
 import render  # noqa: E402
+import batch_clips  # noqa: E402
 
 
 class RenderContractTests(unittest.TestCase):
@@ -64,6 +65,26 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.03", audio_filter)
         self.assertIn("afade=t=out:st=1.970:d=0.03", audio_filter)
 
+    def test_bridge_transition_is_inserted_with_silent_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "hook.mp4"
+            second = Path(tmp) / "full.mp4"
+            output = Path(tmp) / "joined.mp4"
+            with (
+                patch.object(render, "video_duration", side_effect=[3.0, 10.0]),
+                patch.object(render.subprocess, "run") as run,
+            ):
+                render.concat_with_bridge_transition(
+                    [first, second], output, ("pixelize", 0.4)
+                )
+
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=pixelize:duration=0.400:offset=0", graph)
+        self.assertIn("anullsrc=r=48000:cl=stereo:d=0.400", graph)
+        self.assertIn("concat=n=3:v=1:a=0", graph)
+        self.assertNotIn("acrossfade", graph)
+
     def test_composite_shifts_overlays_and_applies_subtitles_last(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             edit_dir = Path(tmp)
@@ -95,6 +116,42 @@ class RenderContractTests(unittest.TestCase):
         self.assertIn("setpts=PTS-STARTPTS+1.5/TB", filter_graph)
         self.assertIn("overlay=enable='between(t,1.500,3.500)'", filter_graph)
         self.assertGreater(filter_graph.rfind("subtitles="), filter_graph.rfind("overlay="))
+
+
+class BatchClipContractTests(unittest.TestCase):
+    def test_cold_open_defaults_to_inserted_bridge_and_counts_its_duration(self) -> None:
+        words = [
+            {"text": "Opening", "start": 0.20, "end": 0.50},
+            {"text": "setup.", "start": 0.55, "end": 0.90},
+            {"text": "Complete", "start": 1.10, "end": 1.40},
+            {"text": "hook.", "start": 1.45, "end": 1.80},
+            {"text": "Ending.", "start": 2.10, "end": 2.50},
+        ]
+        clip = {
+            "id": "S1",
+            "crop_x": 100,
+            "approx_start": 0.20,
+            "approx_end": 2.50,
+            "cut_fillers": False,
+            "cold_open": {
+                "start": 1.10,
+                "end": 1.80,
+                "transition": {"type": "pixelize", "duration": 0.4},
+            },
+        }
+
+        edl, _, _ = batch_clips.build_clip_edl(
+            clip, words, "episode", Path("/tmp/episode.mp4")
+        )
+
+        self.assertEqual(edl["ranges"][0]["group"], 0)
+        self.assertTrue(all(r["group"] == 1 for r in edl["ranges"][1:]))
+        self.assertEqual(edl["transition"]["mode"], "bridge")
+        encoded = sum(
+            batch_clips._ceil_frame(r["end"] - r["start"])
+            for r in edl["ranges"]
+        )
+        self.assertAlmostEqual(edl["total_duration_s"], encoded + 0.4, places=5)
 
 
 class TranscriptTimelineTests(unittest.TestCase):
@@ -136,6 +193,42 @@ class TranscriptTimelineTests(unittest.TestCase):
         self.assertIn("00:00:02,200 --> 00:00:03,100", natural_text)
         self.assertIn("First idea.", natural_text)
         self.assertIn("FIRST IDEA.", upper_text)
+
+    def test_master_srt_inserts_bridge_gap_before_restart_captions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            edit_dir = Path(tmp)
+            transcripts = edit_dir / "transcripts"
+            transcripts.mkdir()
+            (transcripts / "episode.json").write_text(
+                json.dumps(
+                    {
+                        "words": [
+                            {"type": "word", "text": "Hook.", "start": 10.1, "end": 10.8},
+                            {"type": "word", "text": "Restart.", "start": 20.1, "end": 20.8},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            edl = {
+                "sources": {"episode": "../episode.mp4"},
+                "ranges": [
+                    {"source": "episode", "start": 10.0, "end": 12.0, "group": 0},
+                    {"source": "episode", "start": 20.0, "end": 22.0, "group": 1},
+                ],
+            }
+            output = edit_dir / "bridge.srt"
+            render.build_master_srt(
+                edl,
+                edit_dir,
+                output,
+                text_case="natural",
+                transition_gap=0.4,
+            )
+            text = output.read_text(encoding="utf-8")
+
+        self.assertIn("00:00:00,100 --> 00:00:00,800", text)
+        self.assertIn("00:00:02,500 --> 00:00:03,200", text)
 
 
 if __name__ == "__main__":
