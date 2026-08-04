@@ -96,6 +96,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
+- **`cutlist.py compile <cutlist.json>`** — long-form removal edits: validates a cutlist (confirmed part order, removal cuts, chapters) against probed media, inverts cuts into keep ranges, and writes a render-ready `edl.json` plus `cut_report.md` with derived output timings and chapter mapping. `validate` runs the same checks without writing. The cutlist stays the reversible source of truth.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for a 1080p evaluable preview; `--draft` for a 720p cut-point check. `--build-subtitles` generates master.srt inline; add `--subtitle-case natural` to preserve Scribe capitalization.
 - **`subtitle_check.py <video> --srt <master.srt>`** — extracts representative subtitle frames at full output resolution. Mandatory before approving subtitle size/position.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.

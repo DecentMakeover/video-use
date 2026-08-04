@@ -310,6 +310,20 @@ def is_portrait_source(video: Path) -> bool:
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
+def source_fps(video: Path) -> str:
+    """Probed r_frame_rate of the first video stream (e.g. '30/1')."""
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip().splitlines()[0]
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -320,6 +334,8 @@ def extract_segment(
     draft: bool = False,
     crop_filter: str = "",
     canvas: tuple[int, int] | None = None,
+    fps: str = "24",
+    crf: int | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -364,11 +380,12 @@ def extract_segment(
     af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
     if draft:
-        preset, crf = "ultrafast", "28"
+        preset, default_crf = "ultrafast", "28"
     elif preview:
-        preset, crf = "medium", "22"
+        preset, default_crf = "medium", "22"
     else:
-        preset, crf = "fast", "20"
+        preset, default_crf = "fast", "20"
+    crf_value = str(crf) if crf is not None else default_crf
 
     cmd = [
         "ffmpeg", "-nostdin", "-y",
@@ -377,8 +394,8 @@ def extract_segment(
         "-t", f"{duration:.3f}",
         "-vf", vf,
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
+        "-c:v", "libx264", "-preset", preset, "-crf", crf_value,
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -392,6 +409,8 @@ def extract_all_segments(
     preview: bool,
     draft: bool = False,
     work_dir: Path | None = None,
+    fps: str = "24",
+    crf: int | None = None,
 ) -> list[Path]:
     """Extract every EDL range into the selected work directory.
 
@@ -418,6 +437,7 @@ def extract_all_segments(
     sources = edl["sources"]
     src_dims: dict[str, tuple[int, int]] = {}
 
+    fps_cache: dict[Path, str] = {}
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
     if canvas:
@@ -457,10 +477,17 @@ def extract_all_segments(
             print(f"        crop: {crop_filter}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
+        if fps == "source":
+            if src_path not in fps_cache:
+                fps_cache[src_path] = source_fps(src_path)
+            seg_fps = fps_cache[src_path]
+        else:
+            seg_fps = fps
         extract_segment(
             src_path, start, duration, seg_filter, out_path,
             preview=preview, draft=draft,
             crop_filter=crop_filter, canvas=canvas,
+            fps=seg_fps, crf=crf,
         )
         seg_paths.append(out_path)
 
@@ -496,6 +523,7 @@ def concat_with_transitions(
     out_path: Path,
     transition: tuple[str, float],
     preview: bool = False,
+    fps: str = "24",
 ) -> None:
     """Join segments with a crossfade (video xfade + audio acrossfade).
 
@@ -538,7 +566,7 @@ def concat_with_transitions(
         "-filter_complex", ";".join(parts),
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "medium", "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -552,6 +580,7 @@ def concat_with_bridge_transition(
     out_path: Path,
     transition: tuple[str, float],
     preview: bool = False,
+    fps: str = "24",
 ) -> None:
     """Insert a transition between two complete moments.
 
@@ -579,11 +608,11 @@ def concat_with_bridge_transition(
         (
             f"[v0tail]trim=start={max(0.0, durations[0] - handle):.6f}:"
             f"end={durations[0]:.6f},setpts=PTS-STARTPTS,"
-            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps=24,format=yuv420p[vt0]"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps={fps},format=yuv420p[vt0]"
         ),
         (
             f"[v1head]trim=start=0:end={handle:.6f},setpts=PTS-STARTPTS,"
-            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps=24,format=yuv420p[vt1]"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps={fps},format=yuv420p[vt1]"
         ),
         (
             f"[vt0][vt1]xfade=transition={xfade_name}:duration={dur:.3f}:offset=0,"
@@ -610,7 +639,7 @@ def concat_with_bridge_transition(
         "-filter_complex", ";".join(parts),
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "medium", "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -1132,6 +1161,22 @@ def main() -> None:
         help="Draft mode: 720p, ultrafast, CRF 28 — cut-point verification only.",
     )
     ap.add_argument(
+        "--fps",
+        default="24",
+        help="Output frame rate: a number/fraction, or 'source' to keep each "
+        "source's native rate (default: 24, the current engine contract). "
+        "All EDL sources must share one rate when using 'source' — the concat "
+        "step assumes homogeneous segments.",
+    )
+    ap.add_argument(
+        "--crf",
+        type=int,
+        default=None,
+        help="Override libx264 CRF for segment extraction (default: 20 final / "
+        "22 preview / 28 draft). Lower = higher quality; 17-18 is visually "
+        "lossless for delivery masters.",
+    )
+    ap.add_argument(
         "--build-subtitles",
         action="store_true",
         help="Build master.srt from transcripts + EDL offsets before compositing",
@@ -1241,6 +1286,8 @@ def main() -> None:
         preview=args.preview,
         draft=args.draft,
         work_dir=work_dir,
+        fps=args.fps,
+        crf=args.crf,
     )
 
     # 2. Concat → base
@@ -1262,6 +1309,11 @@ def main() -> None:
         raise ValueError(f"unsupported transition mode: {transition_mode}")
     groups = [r.get("group", i) for i, r in enumerate(edl["ranges"])]
     n_groups = len(dict.fromkeys(groups))
+    transition_fps = (
+        source_fps(segment_paths[0])
+        if transition and args.fps == "source"
+        else args.fps
+    )
     if transition and n_groups > 1:
         # Ranges sharing a group are one continuous moment: hard-cut them
         # together first (silence trims must stay invisible), then crossfade
@@ -1277,15 +1329,27 @@ def main() -> None:
                 group_files.append(gpath)
         if transition_mode == "bridge":
             concat_with_bridge_transition(
-                group_files, base_path, transition, preview=args.preview
+                group_files,
+                base_path,
+                transition,
+                preview=args.preview,
+                fps=transition_fps,
             )
         else:
             concat_with_transitions(
-                group_files, base_path, transition, preview=args.preview
+                group_files,
+                base_path,
+                transition,
+                preview=args.preview,
+                fps=transition_fps,
             )
     elif transition and len(segment_paths) > 1:
         concat_with_transitions(
-            segment_paths, base_path, transition, preview=args.preview
+            segment_paths,
+            base_path,
+            transition,
+            preview=args.preview,
+            fps=transition_fps,
         )
     else:
         concat_segments(segment_paths, base_path, work_dir)

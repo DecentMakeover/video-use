@@ -20,11 +20,12 @@ Current deterministic helpers own:
 - Segment extraction, audio fades, concat, and output-timeline caption math
 - Grade, loudness, overlay composition, and subtitle ordering
 - QC frame and timeline extraction
+- Cutlist validation, cut inversion into keep ranges, and derived output timings for long-form removal edits (`helpers/cutlist.py`), including word-boundary evidence from cached transcripts
 
 Future deterministic helpers should own:
 
 - Content fingerprints and transcript-cache validation
-- EDL schema and word-boundary validation
+- Schema validation for hand-authored EDLs
 - Configurable canvas, frame rate, and delivery profiles
 - Namespaced multi-output runs and interchange generation
 
@@ -46,7 +47,7 @@ The root skill chooses zero or one workflow contract. A clear match loads one; t
 | --- | --- |
 | Street interviews | Foundation workflow for selecting and rendering interview montages |
 | Podcast clips | Candidate handoff plus one approved clip render per run; batch namespacing and active-speaker reframing remain future work |
-| Podcast editing | Editor-ready cut planning and simple mixed-master rough cuts; not yet multicam or NLE-grade |
+| Podcast editing | Editor-ready cut planning and simple mixed-master rough cuts via the cutlist compiler; not yet multicam or NLE-grade |
 
 The existing generic workflow remains available. The agent asks a routing question only when the choice materially changes the deliverables or approval gates.
 

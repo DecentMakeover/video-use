@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "parts": [
+    {"source": "episode_part1", "file": "../episode_part1.mp4"},
+    {"source": "episode_part2", "file": "../episode_part2.mp4"}
+  ],
+  "cuts": [
+    {
+      "source": "episode_part1",
+      "start": 870.0,
+      "end": 889.0,
+      "category": "false_start",
+      "reason": "Restarted the answer about launch timing",
+      "quote": "Wait, let me start that again"
+    },
+    {
+      "source": "episode_part2",
+      "start": 0.0,
+      "end": 42.5,
+      "category": "logistics",
+      "reason": "Mic check and reseating after the recording break"
+    }
+  ],
+  "chapters": [
+    {"source": "episode_part1", "at": 0.0, "title": "Cold open"},
+    {"source": "episode_part2", "at": 312.5, "title": "Listener questions"}
+  ]
+}

@@ -39,12 +39,14 @@ The agent decides which tangents or repetitions can be removed, how much convers
 - Measure audio and media properties without making editorial decisions
 - Export reversible edit data and QC evidence within supported scope
 
+For supported sources, `helpers/cutlist.py` implements this contract: it validates `edit/cutlist.json` (part order, cut edges against probed durations, chapter markers, word-boundary evidence from cached transcripts) and compiles it into a derived `edl.json` plus `edit/cut_report.md`. The cutlist, not the EDL, is the reversible record of the edit.
+
 ## Lifecycle and approvals
 
 1. Verify source roles, order, synchronization, and clean content boundaries.
 2. Write `edit/cutlist.md` with primary cuts, optional tightening, chapter markers, fact-check flags, literal filenames, exact ranges, exact quotes, and rationale.
 3. Obtain approval for the narrative plan and substantive cut list.
-4. When the sources fit EDL v1, create a reversible rough-cut EDL and review preview.
+4. When the sources fit EDL v1, record the approved cuts in `edit/cutlist.json` (starting from `workflows/cutlist.example.json`), compile it with `helpers/cutlist.py compile`, resolve or explicitly accept every reported warning, and review the preview rendered from the derived EDL.
 5. Obtain picture/content-lock approval before final rendering.
 6. Obtain separate approval for mix and caption treatment when applicable.
 
@@ -55,7 +57,7 @@ Handoff-first scope:
 - Verified source/part map
 - `edit/cutlist.md`
 - Chapter outline and fact-check flags
-- Optional EDL v1 rough cut for supported sources
+- Optional EDL v1 rough cut for supported sources, compiled from `edit/cutlist.json` with its `cut_report.md` as QC evidence
 
 Future NLE-grade scope:
 
