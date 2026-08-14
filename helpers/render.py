@@ -2,9 +2,10 @@
 
 Implements the HEURISTICS render pipeline in the correct order:
 
-  1. Per-segment extract with color grade + 30ms audio fades baked in
-  2. Lossless -c copy concat into base.mp4
-  3. If overlays or subtitles: single filter graph that overlays animations
+  1. Build one cumulative rational frame/sample schedule for the whole EDL
+  2. Extract video-only and lossless PCM segments with exact counts and reset PTS
+  3. Concatenate video and audio independently, then mux into base.mov
+  4. If overlays or subtitles: single filter graph that overlays animations
      (with PTS shift so frame 0 lands at the overlay window start)
      and applies `subtitles` filter LAST → final.mp4
 
@@ -29,6 +30,9 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 
 try:
@@ -237,6 +241,103 @@ def is_portrait_source(video: Path) -> bool:
         return False
 
 
+# -------- Canonical output schedule -----------------------------------------
+
+
+AUDIO_RATE = 48_000
+AAC_FRAME_SAMPLES = 1_024
+
+
+@dataclass(frozen=True)
+class SegmentSchedule:
+    index: int
+    start_frames: int
+    end_frames: int
+    start_samples: int
+    end_samples: int
+
+    @property
+    def frame_count(self) -> int:
+        return self.end_frames - self.start_frames
+
+    @property
+    def sample_count(self) -> int:
+        return self.end_samples - self.start_samples
+
+
+@dataclass(frozen=True)
+class RenderSchedule:
+    fps: Fraction
+    sample_rate: int
+    segments: tuple[SegmentSchedule, ...]
+
+    @property
+    def total_frames(self) -> int:
+        return self.segments[-1].end_frames if self.segments else 0
+
+    @property
+    def total_samples(self) -> int:
+        return self.segments[-1].end_samples if self.segments else 0
+
+
+def _as_fraction(value: object) -> Fraction:
+    """Convert JSON-style numbers without introducing binary float error."""
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, Decimal):
+        return Fraction(value)
+    return Fraction(str(value))
+
+
+def _round_fraction(value: Fraction) -> int:
+    """Round a non-negative rational half up, deterministically."""
+    if value < 0:
+        raise ValueError(f"timeline values must be non-negative (got {value})")
+    return (2 * value.numerator + value.denominator) // (2 * value.denominator)
+
+
+def build_render_schedule(
+    ranges: list[dict], fps: str | Fraction, sample_rate: int = AUDIO_RATE
+) -> RenderSchedule:
+    """Allocate exact counts from cumulative boundaries, never per-range rounding."""
+    rate = _as_fraction(fps)
+    if rate <= 0 or sample_rate <= 0:
+        raise ValueError("output frame and sample rates must be positive")
+
+    cumulative = Fraction(0)
+    previous_frames = 0
+    previous_samples = 0
+    result: list[SegmentSchedule] = []
+    for index, item in enumerate(ranges):
+        duration = _as_fraction(item["end"]) - _as_fraction(item["start"])
+        if duration <= 0:
+            raise ValueError(f"range {index} has non-positive duration {duration}")
+        cumulative += duration
+        end_frames = _round_fraction(cumulative * rate)
+        end_samples = _round_fraction(cumulative * sample_rate)
+        segment = SegmentSchedule(
+            index=index,
+            start_frames=previous_frames,
+            end_frames=end_frames,
+            start_samples=previous_samples,
+            end_samples=end_samples,
+        )
+        if segment.frame_count <= 0:
+            raise ValueError(
+                f"range {index} is too short to allocate one frame at {rate} fps"
+            )
+        if segment.sample_count <= 0:
+            raise ValueError(f"range {index} is too short to allocate one audio sample")
+        result.append(segment)
+        previous_frames = end_frames
+        previous_samples = end_samples
+    return RenderSchedule(rate, sample_rate, tuple(result))
+
+
+def _fps_text(fps: Fraction) -> str:
+    return str(fps.numerator) if fps.denominator == 1 else f"{fps.numerator}/{fps.denominator}"
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
@@ -254,6 +355,30 @@ def source_fps(video: Path) -> str:
     return out.stdout.strip().splitlines()[0]
 
 
+def resolve_output_fps(edl: dict, edit_dir: Path, requested: str) -> Fraction:
+    """Resolve one homogeneous output rate before constructing the schedule."""
+    if requested != "source":
+        return _as_fraction(requested)
+    selected_sources = {item["source"] for item in edl["ranges"]}
+    rates = {
+        _as_fraction(source_fps(resolve_path(edl["sources"][name], edit_dir)))
+        for name in selected_sources
+    }
+    if len(rates) != 1:
+        formatted = ", ".join(sorted(_fps_text(rate) for rate in rates))
+        raise ValueError(
+            "--fps source requires all selected sources to share one rate; "
+            f"found {formatted}"
+        )
+    return rates.pop()
+
+
+@dataclass(frozen=True)
+class SegmentPaths:
+    video: Path
+    audio: Path
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -266,11 +391,17 @@ def extract_segment(
     crf: int | None = None,
     fade_in: float = 0.0,
     fade_out: float = 0.0,
-) -> None:
-    """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+    long_edge: int = 1920,
+    frame_count: int | None = None,
+    sample_count: int | None = None,
+    audio_out_path: Path | None = None,
+) -> SegmentPaths:
+    """Extract exact-count H.264 video and lossless PCM audio intermediates.
 
-    `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
-    Portrait sources (height > width) are scaled by height to preserve orientation.
+    `-ss` before `-i` for fast accurate seeking. Scales the long edge to
+    `long_edge` px (default 1920 → 1080p landscape; 3840 → 4K). Sources smaller
+    than the target are upscaled; portrait sources scale by height to preserve
+    orientation.
 
     `fade_in`/`fade_out` (seconds) fade the segment from/to black for
     montage-style transitions (cold opens, highlight reels). The audio fade
@@ -289,15 +420,37 @@ def extract_segment(
         raise ValueError(
             f"segment fades ({fade_in:g}s + {fade_out:g}s) exceed the {duration:.3f}s segment"
         )
+    rate = _as_fraction(fps)
+    if frame_count is None:
+        frame_count = _round_fraction(_as_fraction(duration) * rate)
+    if sample_count is None:
+        sample_count = _round_fraction(_as_fraction(duration) * AUDIO_RATE)
+    if frame_count <= 0 or sample_count <= 0:
+        raise ValueError("segment must allocate at least one frame and one sample")
+    audio_path = audio_out_path or out_path.with_suffix(".pcm.wav")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+    video_duration = Fraction(frame_count, 1) / rate
+    audio_duration = Fraction(sample_count, AUDIO_RATE)
+    video_seconds = float(video_duration)
+    audio_seconds = float(audio_duration)
 
     portrait = is_portrait_source(source)
     if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        draft_edge = min(long_edge, 1280)
+        scale = f"scale=-2:{draft_edge}" if portrait else f"scale={draft_edge}:-2"
     else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        scale = f"scale=-2:{long_edge}" if portrait else f"scale={long_edge}:-2"
 
-    vf_parts: list[str] = []
+    fps_expr = _fps_text(rate)
+    vf_parts: list[str] = [
+        "setpts=PTS-STARTPTS",
+        f"fps=fps={fps_expr}:round=near",
+        "tpad=stop_mode=clone:stop=-1",
+        f"trim=end_frame={frame_count}",
+        f"setpts=N/({fps_expr}*TB)",
+    ]
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
     vf_parts.append(scale)
@@ -306,15 +459,27 @@ def extract_segment(
     if fade_in > 0:
         vf_parts.append(f"fade=t=in:st=0:d={fade_in:.3f}")
     if fade_out > 0:
-        vf_parts.append(f"fade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}")
+        vf_parts.append(
+            f"fade=t=out:st={max(0.0, video_seconds - fade_out):.6f}:d={fade_out:.6f}"
+        )
     vf = ",".join(vf_parts)
 
-    # Audio fades at both edges: at least the 30ms de-pop (Rule 3), widened
-    # to track any visual fade so sound and picture arrive/leave together.
+    # Audio remains PCM. Exact sample padding/trimming and a second PTS reset
+    # make every segment independently start at sample zero without AAC priming.
     afade_in = max(0.03, fade_in)
     afade_out = max(0.03, fade_out)
-    fade_out_start = max(0.0, duration - afade_out)
-    af = f"afade=t=in:st=0:d={afade_in:.3f},afade=t=out:st={fade_out_start:.3f}:d={afade_out:.3f}"
+    fade_out_start = max(0.0, audio_seconds - afade_out)
+    af = ",".join(
+        [
+            "asetpts=PTS-STARTPTS",
+            f"aresample={AUDIO_RATE}:async=0:first_pts=0",
+            f"apad=whole_len={sample_count}",
+            f"atrim=end_sample={sample_count}",
+            f"asetpts=N/{AUDIO_RATE}/TB",
+            f"afade=t=in:st=0:d={afade_in:.6f}",
+            f"afade=t=out:st={fade_out_start:.6f}:d={afade_out:.6f}",
+        ]
+    )
 
     if draft:
         preset, default_crf = "ultrafast", "28"
@@ -326,18 +491,22 @@ def extract_segment(
 
     cmd = [
         "ffmpeg", "-y",
-        "-ss", f"{seg_start:.3f}",
+        "-ss", f"{seg_start:.9f}",
         "-i", str(source),
-        "-t", f"{duration:.3f}",
+        "-map", "0:v:0", "-an",
         "-vf", vf,
-        "-af", af,
+        "-frames:v", str(frame_count),
         "-c:v", "libx264", "-preset", preset, "-crf", crf_value,
-        "-pix_fmt", "yuv420p", "-r", str(fps),
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
         "-movflags", "+faststart",
         str(out_path),
+        "-map", "0:a:0", "-vn",
+        "-af", af,
+        "-c:a", "pcm_s24le", "-ar", str(AUDIO_RATE),
+        str(audio_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return SegmentPaths(out_path, audio_path)
 
 
 def extract_all_segments(
@@ -345,11 +514,13 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
-    fps: str = "24",
+    fps: str | Fraction = "24",
     crf: int | None = None,
-) -> list[Path]:
-    """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
-    Returns the ordered list of segment paths.
+    long_edge: int = 1920,
+    schedule: RenderSchedule | None = None,
+) -> list[SegmentPaths]:
+    """Extract every EDL range to separate exact-count video and PCM files.
+    Returns the ordered video/audio path pairs.
 
     If the EDL `grade` is "auto", analyze each segment range with
     `auto_grade_for_clip` and apply a per-segment subtle correction.
@@ -365,18 +536,30 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
 
-    fps_cache: dict[Path, str] = {}
-    seg_paths: list[Path] = []
-    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    if schedule is None:
+        if fps == "source":
+            resolved_rate = resolve_output_fps(edl, edit_dir, "source")
+        else:
+            resolved_rate = _as_fraction(fps)
+        schedule = build_render_schedule(ranges, resolved_rate)
+    if len(schedule.segments) != len(ranges):
+        raise ValueError("render schedule/range count mismatch")
+
+    seg_paths: list[SegmentPaths] = []
+    print(
+        f"extracting {len(ranges)} segment(s) → {clips_dir.name}/ "
+        f"({schedule.total_frames} frames, {schedule.total_samples} samples)"
+    )
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
-    for i, r in enumerate(ranges):
+    for i, (r, allocation) in enumerate(zip(ranges, schedule.segments)):
         src_name = r["source"]
         src_path = resolve_path(sources[src_name], edit_dir)
         start = float(r["start"])
         end = float(r["end"])
         duration = end - start
-        out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
+        video_path = clips_dir / f"seg_{i:04d}_{src_name}.video.mp4"
+        audio_path = clips_dir / f"seg_{i:04d}_{src_name}.audio.wav"
 
         if is_auto:
             seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
@@ -393,18 +576,15 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{fade_note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        if fps == "source":
-            if src_path not in fps_cache:
-                fps_cache[src_path] = source_fps(src_path)
-            seg_fps = fps_cache[src_path]
-        else:
-            seg_fps = fps
-        extract_segment(
-            src_path, start, duration, seg_filter, out_path,
-            preview=preview, draft=draft, fps=seg_fps, crf=crf,
-            fade_in=fade_in, fade_out=fade_out,
+        paths = extract_segment(
+            src_path, start, duration, seg_filter, video_path,
+            preview=preview, draft=draft, fps=_fps_text(schedule.fps), crf=crf,
+            fade_in=fade_in, fade_out=fade_out, long_edge=long_edge,
+            frame_count=allocation.frame_count,
+            sample_count=allocation.sample_count,
+            audio_out_path=audio_path,
         )
-        seg_paths.append(out_path)
+        seg_paths.append(paths)
 
     return seg_paths
 
@@ -412,23 +592,60 @@ def extract_all_segments(
 # -------- Lossless concat ----------------------------------------------------
 
 
-def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
-    """Lossless concat via the concat demuxer. No re-encode."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    concat_list = edit_dir / "_concat.txt"
-    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
+def _write_concat_list(path: Path, inputs: list[Path]) -> None:
+    # ffconcat single-quoted paths escape an apostrophe as '\''.
+    def quote(item: Path) -> str:
+        escaped = str(item.resolve()).replace("'", "'\\''")
+        return f"file '{escaped}'\n"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(out_path),
+    path.write_text("".join(quote(item) for item in inputs))
+
+
+def concat_segments(
+    segment_paths: list[SegmentPaths], out_path: Path, edit_dir: Path
+) -> None:
+    """Concat video and PCM independently, then losslessly mux them.
+
+    Keeping the tracks separate is intentional: the concat demuxer advances a
+    multiplexed file by its longest stream, which can add a sub-frame gap at
+    every segment when independently quantized video/audio durations differ.
+    """
+    if not segment_paths:
+        raise ValueError("cannot concatenate an empty segment list")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    video_list = edit_dir / "_concat_video.txt"
+    audio_list = edit_dir / "_concat_audio.txt"
+    video_concat = edit_dir / "_video_concat.mp4"
+    audio_concat = edit_dir / "_audio_concat.wav"
+    _write_concat_list(video_list, [item.video for item in segment_paths])
+    _write_concat_list(audio_list, [item.audio for item in segment_paths])
+
+    commands = [
+        [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(video_list),
+            "-map", "0:v:0", "-c:v", "copy", "-an", "-movflags", "+faststart",
+            str(video_concat),
+        ],
+        [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(audio_list),
+            "-map", "0:a:0", "-c:a", "copy", "-vn", "-rf64", "auto",
+            str(audio_concat),
+        ],
+        [
+            "ffmpeg", "-y", "-i", str(video_concat), "-i", str(audio_concat),
+            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+            "-movflags", "+faststart", str(out_path),
+        ],
     ]
-    print(f"concat → {out_path.name}")
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    concat_list.unlink(missing_ok=True)
+    print(f"concat video + PCM → {out_path.name}")
+    try:
+        for command in commands:
+            subprocess.run(
+                command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+    finally:
+        for temporary in (video_list, audio_list, video_concat, audio_concat):
+            temporary.unlink(missing_ok=True)
 
 
 # -------- Master SRT (Rule 5) ------------------------------------------------
@@ -465,6 +682,8 @@ def build_master_srt(
     edit_dir: Path,
     out_path: Path,
     text_case: str = "upper",
+    schedule: RenderSchedule | None = None,
+    fps: str | Fraction = "24",
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
@@ -476,18 +695,20 @@ def build_master_srt(
     sources = edl["sources"]
 
     entries: list[tuple[float, float, str]] = []
-    seg_offset = 0.0
+    if schedule is None:
+        schedule = build_render_schedule(edl["ranges"], fps)
 
-    for r in edl["ranges"]:
+    for index, r in enumerate(edl["ranges"]):
         src_name = r["source"]
         seg_start = float(r["start"])
         seg_end = float(r["end"])
-        seg_duration = seg_end - seg_start
+        allocation = schedule.segments[index]
+        seg_offset = float(Fraction(allocation.start_frames, 1) / schedule.fps)
+        seg_duration = float(Fraction(allocation.frame_count, 1) / schedule.fps)
 
         tr_path = transcripts_dir / f"{src_name}.json"
         if not tr_path.exists():
             print(f"  no transcript for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration
             continue
 
         transcript = json.loads(tr_path.read_text())
@@ -512,10 +733,12 @@ def build_master_srt(
         for chunk in chunks:
             local_start = max(seg_start, chunk[0].get("start", seg_start))
             local_end = min(seg_end, chunk[-1].get("end", seg_end))
-            out_start = max(0.0, local_start - seg_start) + seg_offset
-            out_end = max(0.0, local_end - seg_start) + seg_offset
+            out_start = min(seg_duration, max(0.0, local_start - seg_start)) + seg_offset
+            out_end = min(seg_duration, max(0.0, local_end - seg_start)) + seg_offset
             if out_end <= out_start:
-                out_end = out_start + 0.4
+                # The word only touched the cut boundary and has no canonical
+                # on-screen duration in this segment; do not leak it past the cut.
+                continue
             text = " ".join((w.get("text") or "").strip() for w in chunk)
             text = re.sub(r"\s+", " ", text).strip()
             # Strip pause punctuation that looks awkward on short chunks.
@@ -525,8 +748,6 @@ def build_master_srt(
             elif text_case != "natural":
                 raise ValueError(f"unsupported subtitle case: {text_case}")
             entries.append((out_start, out_end, text))
-
-        seg_offset += seg_duration
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
@@ -656,6 +877,7 @@ def build_final_composite(
     out_path: Path,
     edit_dir: Path,
     subtitle_force_style: str | None = None,
+    fps: str | Fraction = "24",
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -669,6 +891,12 @@ def build_final_composite(
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
+    rate = _as_fraction(fps)
+
+    def snap_to_frame(seconds: object) -> float:
+        frame = _round_fraction(_as_fraction(seconds) * rate)
+        return float(Fraction(frame, 1) / rate)
+
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
@@ -677,18 +905,18 @@ def build_final_composite(
     filter_parts: list[str] = []
     # PTS-shift every overlay so its frame 0 lands at start_in_output
     for idx, ov in enumerate(overlays, start=1):
-        t = float(ov["start_in_output"])
-        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
+        t = snap_to_frame(ov["start_in_output"])
+        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{t:.9f}/TB[a{idx}]")
 
     # Chain overlays on top of base
     current = "[0:v]"
     for idx, ov in enumerate(overlays, start=1):
-        t = float(ov["start_in_output"])
-        dur = float(ov["duration"])
-        end = t + dur
+        t = snap_to_frame(ov["start_in_output"])
+        end = snap_to_frame(_as_fraction(ov["start_in_output"]) + _as_fraction(ov["duration"]))
         next_label = f"[v{idx}]"
         filter_parts.append(
-            f"{current}[a{idx}]overlay=enable='between(t,{t:.3f},{end:.3f})'{next_label}"
+            f"{current}[a{idx}]overlay="
+            f"enable='gte(t,{t:.9f})*lt(t,{end:.9f})'{next_label}"
         )
         current = next_label
 
@@ -720,6 +948,7 @@ def build_final_composite(
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
+        "-fps_mode", "cfr", "-r", _fps_text(rate),
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -727,6 +956,19 @@ def build_final_composite(
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
     if has_subs:
         print(f"  subtitle style: {subtitle_force_style or build_subtitle_force_style(base_path)}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def encode_aac_once(input_path: Path, output_path: Path) -> None:
+    """Copy final video and perform the pipeline's only AAC encode."""
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "-i", str(input_path),
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE),
+        "-movflags", "+faststart", str(output_path),
+    ]
+    print(f"  final AAC encode → {output_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -762,6 +1004,14 @@ def main() -> None:
         help="Override libx264 CRF for segment extraction (default: 20 final / "
         "22 preview / 28 draft). Lower = higher quality; 17-18 is visually "
         "lossless for delivery masters.",
+    )
+    ap.add_argument(
+        "--long-edge",
+        type=int,
+        default=1920,
+        help="Output long-edge resolution in px (default 1920 → 1080p; "
+        "3840 → 4K, 2560 → 1440p). Sources smaller than the target are "
+        "upscaled, so mixed-resolution edits deliver at one canvas.",
     )
     ap.add_argument(
         "--build-subtitles",
@@ -828,23 +1078,29 @@ def main() -> None:
     if not edl_path.exists():
         sys.exit(f"edl not found: {edl_path}")
 
-    edl = json.loads(edl_path.read_text())
+    edl = json.loads(edl_path.read_text(), parse_float=Decimal)
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
+    output_fps = resolve_output_fps(edl, edit_dir, args.fps)
+    schedule = build_render_schedule(edl["ranges"], output_fps)
+    print(
+        f"canonical schedule: {_fps_text(output_fps)} fps, "
+        f"{schedule.total_frames} frames, {schedule.total_samples} samples"
+    )
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
         edl, edit_dir, preview=args.preview, draft=args.draft,
-        fps=args.fps, crf=args.crf,
+        fps=output_fps, crf=args.crf, long_edge=args.long_edge, schedule=schedule,
     )
 
     # 2. Concat → base
     if args.draft:
-        base_name = "base_draft.mp4"
+        base_name = "base_draft.mov"
     elif args.preview:
-        base_name = "base_preview.mp4"
+        base_name = "base_preview.mov"
     else:
-        base_name = "base.mp4"
+        base_name = "base.mov"
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
 
@@ -858,6 +1114,7 @@ def main() -> None:
                 edit_dir,
                 subs_path,
                 text_case=args.subtitle_case,
+                schedule=schedule,
             )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
@@ -874,22 +1131,19 @@ def main() -> None:
         raw_style=args.subtitle_force_style,
     )
 
-    # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
+    # 4. Composite with PCM retained, then perform exactly one final AAC encode.
     overlays = edl.get("overlays") or []
+    tmp_composite = out_path.with_suffix(".prenorm.mov")
+    build_final_composite(
+        base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style,
+        fps=output_fps,
+    )
     if args.no_loudnorm:
-        # Composite directly to final output
-        build_final_composite(
-            base_path, overlays, subs_path, out_path, edit_dir, subtitle_force_style
-        )
+        encode_aac_once(tmp_composite, out_path)
     else:
-        # Composite to a temp file, then run loudnorm → final output
-        tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(
-            base_path, overlays, subs_path, tmp_composite, edit_dir, subtitle_force_style
-        )
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
-        tmp_composite.unlink(missing_ok=True)
+    tmp_composite.unlink(missing_ok=True)
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"\ndone: {out_path} ({size_mb:.1f} MB)")
