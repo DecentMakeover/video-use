@@ -328,6 +328,8 @@ Match the source unless the user asked for something specific. Common targets: `
 
 `grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
 
+Ranges may set optional `fade_in` / `fade_out` (seconds) to fade that segment from/to black — for cold opens and highlight montages where hard cuts between non-contiguous moments read as mistakes. The audio fade widens to match the picture (30ms de-pop floor still applies). Fades that together exceed the segment duration are rejected.
+
 ## Memory — `project.md`
 
 Append one section per session at `<edit>/project.md`:
