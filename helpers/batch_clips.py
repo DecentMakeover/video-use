@@ -670,7 +670,7 @@ def render_clip(
             "--subtitle-font-size",
             "14",
             "--subtitle-margin-v",
-            "105",
+            "45",
             "--subtitle-outline",
             "1",
         ]
