@@ -12,7 +12,7 @@ Current support is editor-ready content planning plus simple rough cuts from a m
 
 ## Editorial outcome
 
-Remove logistics, false starts, unusable sections, dead air, and true repetition while preserving conversational cadence, nuance, reactions, and the speaker's intended meaning. Identify chapters and fact-check risks without turning uncertain statements into clean claims.
+Remove logistics, false starts, unusable sections, dead air, and true repetition while preserving conversational cadence, nuance, reactions, and the speaker's intended meaning. Identify chapters and guest-claim attribution notes without turning uncertain statements into clean claims; these notes are nonblocking.
 
 ## Intake
 
@@ -22,14 +22,14 @@ Establish:
 - Whether sources are sequential parts, cameras, isolated microphones, or a mixed master
 - Speaker map, synchronization evidence, and known clean content boundaries
 - Intro, outro, ads, music, screen recordings, and B-roll
-- Must-keep, must-cut, fact-check, and sensitivity notes
+- Must-keep, must-cut, guest-claim attribution, and hard-safety notes
 - Target shape, runtime, delivery format, and intended editor handoff
 
 Never infer combined timing merely from filename order. If the sources require multicam or separate-track synchronization, stop at a verified handoff unless the missing capability is implemented and tested.
 
 ## Agent judgment
 
-The agent decides which tangents or repetitions can be removed, how much conversational air and reaction to retain, where chapters belong, and which uncertain references require fact-checking. Substantive cuts must remain reversible and explain why the episode improves without changing meaning.
+The agent decides which tangents or repetitions can be removed, how much conversational air and reaction to retain, and where chapters belong. Uncertain references retain the speaker's attribution and hedges but do not create an external-verification gate. Substantive cuts must remain reversible and explain why the episode improves without changing meaning.
 
 ## Deterministic engine responsibilities
 
@@ -42,7 +42,7 @@ The agent decides which tangents or repetitions can be removed, how much convers
 ## Lifecycle and approvals
 
 1. Verify source roles, order, synchronization, and clean content boundaries.
-2. Write `edit/cutlist.md` with primary cuts, optional tightening, chapter markers, fact-check flags, literal filenames, exact ranges, exact quotes, and rationale.
+2. Write `edit/cutlist.md` with primary cuts, optional tightening, chapter markers, nonblocking guest-claim notes, hard-safety flags, literal filenames, exact ranges, exact quotes, and rationale.
 3. Obtain approval for the narrative plan and substantive cut list.
 4. When the sources fit EDL v1, create a reversible rough-cut EDL and review preview.
 5. Obtain picture/content-lock approval before final rendering.
@@ -54,7 +54,7 @@ Handoff-first scope:
 
 - Verified source/part map
 - `edit/cutlist.md`
-- Chapter outline and fact-check flags
+- Chapter outline, guest-claim notes, and hard-safety flags
 - Optional EDL v1 rough cut for supported sources
 
 Future NLE-grade scope:
